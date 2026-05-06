@@ -1,0 +1,13 @@
+.env
+node_modules/
+HANDOFF.md
+.handoffs/
+*.log
+.DS_Store
+
+# personal Claude Code project settings
+.claude/settings.local.json
+
+# dispatcher state and wake-trigger files (phase 2.1+)
+state/
+.wake-trigger.json
