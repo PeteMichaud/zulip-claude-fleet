@@ -1,0 +1,9 @@
+{
+  "_comment": "Copy to shared-mcp.json and replace __PROJECT_DIR__ with the absolute path to this repo on your machine. The dispatcher passes this file via --mcp-config when spawning bots.",
+  "mcpServers": {
+    "zulip-channel": {
+      "command": "bun",
+      "args": ["run", "__PROJECT_DIR__/zulip-channel.ts"]
+    }
+  }
+}

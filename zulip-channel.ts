@@ -11,7 +11,7 @@ import {
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
-import { appendFileSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync, unlinkSync } from 'node:fs';
 
 // ---------- Debug log ----------
 // stderr from MCP servers goes somewhere we can't easily find;
@@ -120,7 +120,15 @@ const mcp = new Server(
 );
 
 // ---------- Tools ----------
-mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
+// Tracks the first ListTools call so the wake-trigger replay knows when
+// Claude Code is ready to receive channel notifications. See the deferred
+// replay block further down. Declared up here so the handler closure doesn't
+// reference an uninitialized variable if Claude calls ListTools fast.
+let listToolsCalledAt: number | null = null;
+
+mcp.setRequestHandler(ListToolsRequestSchema, async () => {
+  if (listToolsCalledAt === null) listToolsCalledAt = Date.now();
+  return {
   tools: [
     {
       name: 'send',
@@ -149,7 +157,8 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
   ],
-}));
+};
+});
 
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   const args = (req.params.arguments ?? {}) as Record<string, any>;
@@ -307,6 +316,72 @@ async function emitVerdict(requestId: string, behavior: 'allow' | 'deny') {
 // ---------- Connect MCP ----------
 await mcp.connect(new StdioServerTransport());
 debug('MCP transport connected; capabilities advertised: claude/channel, claude/channel/permission, tools');
+
+// ---------- Wake-trigger replay ----------
+// If the dispatcher (phase 2.1+) spawned us, it writes the inbound that woke
+// the bot to .wake-trigger.json in cwd before launch. Replay it as a channel
+// notification so Claude sees it the same way as a normal Zulip inbound, then
+// delete the file. Absent file = normal startup, nothing to replay.
+//
+// Deferred until Claude Code finishes initial setup. Empirically, sending the
+// notification immediately after mcp.connect() returns means Claude doesn't
+// receive it — the channel listener isn't fully wired yet on Claude Code's
+// side. We defer until after the first ListTools request, which Claude Code
+// issues during its post-init tool discovery; by then the channel pipeline is
+// live. Belt-and-braces: also defer at least 500ms regardless.
+const waitForReady = (async () => {
+  const deadline = Date.now() + 2000;
+  while (listToolsCalledAt === null && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  // Either ListTools fired or we hit the 2s ceiling; small buffer either way.
+  await new Promise((r) => setTimeout(r, 200));
+  debug('wake-trigger: ready signal (listToolsCalledAt=' + listToolsCalledAt + ')');
+})();
+waitForReady.then(replayWakeTriggerIfPresent).catch((err) => debug('wake-trigger: replay failed:', err.message));
+
+async function replayWakeTriggerIfPresent() {
+  const path = '.wake-trigger.json';
+  if (!existsSync(path)) return;
+
+  let parsed: { stream?: string; topic?: string; sender?: string; content?: string };
+  try {
+    parsed = JSON.parse(readFileSync(path, 'utf-8'));
+  } catch (err: any) {
+    debug('wake-trigger: file present but unparseable, leaving in place:', err.message);
+    return;
+  }
+
+  if (!parsed.content || !parsed.stream) {
+    debug('wake-trigger: missing required fields (need content + stream), leaving in place');
+    return;
+  }
+
+  const topic = parsed.topic || DEFAULT_TOPIC;
+  debug('wake-trigger: replaying', { stream: parsed.stream, topic, sender: parsed.sender ?? '' });
+
+  // Match the same lastInbound bookkeeping handleMessage does, so any
+  // immediate permission prompt routes back to where the wake came from.
+  lastInbound = { stream: parsed.stream, topic };
+
+  await mcp.notification({
+    method: 'notifications/claude/channel',
+    params: {
+      content: parsed.content,
+      meta: {
+        stream: parsed.stream,
+        topic,
+        sender: parsed.sender ?? '',
+      },
+    },
+  });
+
+  try {
+    unlinkSync(path);
+  } catch (err: any) {
+    debug('wake-trigger: failed to unlink after replay (non-fatal):', err.message);
+  }
+}
 
 // ---------- Zulip event queue ----------
 let queueId: string | undefined;

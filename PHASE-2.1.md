@@ -18,7 +18,7 @@ In phase 1 the bot's working tree *is* the project repo — Pete launches Claude
 ├── .env                      # site, owner id, briefing-bot creds (for now)
 └── ...
 
-~/briefing/                   # NEW: briefing-bot's working tree
+~/claude-fleet/briefing/                   # NEW: briefing-bot's working tree
 ├── CLAUDE.md                 # MOVED from zulip-claude-channel
 ├── HANDOFF.md                # written by /handoff (lands in 2.3, but tree exists now)
 └── ...                       # whatever the bot is working on
@@ -59,7 +59,7 @@ The wake-trigger message — the inbound that caused the dispatcher to spawn —
 
 **Mechanism: dispatcher writes a file; channel server reads + replays.**
 
-Before spawning, dispatcher writes `~/briefing/.wake-trigger.json`:
+Before spawning, dispatcher writes `~/claude-fleet/briefing/.wake-trigger.json`:
 
 ```json
 {
@@ -128,20 +128,20 @@ Absolute path so it resolves regardless of cwd. The bot's working tree no longer
 
 ## Migration steps from phase 1
 
-1. `mkdir ~/briefing && mv ~/zulip-claude-channel/CLAUDE.md ~/briefing/CLAUDE.md`.
+1. `mkdir -p ~/claude-fleet/briefing && mv ~/zulip-claude-channel/CLAUDE.md ~/claude-fleet/briefing/CLAUDE.md`.
 2. Remove `~/zulip-claude-channel/.mcp.json` (it's no longer the source for spawned bots; the file lingering would confuse Claude Code if launched from the project root).
 3. Create `~/zulip-claude-channel/shared-mcp.json`.
 4. Update `zulip-channel.ts` to handle `.wake-trigger.json` on startup.
 5. Write `~/zulip-claude-channel/dispatcher.ts`.
 6. Update `.gitignore` for `state/` and `.wake-trigger.json`.
-7. Write `RUNBOOK-2.1.md` covering: install dispatcher as launchd/systemd unit (or run in tmux), provision `~/briefing/`, verify wake-on-message works.
+7. Write `RUNBOOK-2.1.md` covering: install dispatcher as launchd/systemd unit (or run in tmux), provision `~/claude-fleet/briefing/`, verify wake-on-message works.
 
 ## Build order within 2.1
 
 Each step is independently testable.
 
-1. **Wake-trigger handling in channel server.** Add the file-read-and-replay logic. Test by manually dropping `.wake-trigger.json` in `~/briefing/` and launching the channel server directly (no dispatcher yet) — confirm Claude sees the message.
-2. **Layout migration.** Move CLAUDE.md, create `~/briefing/`, write `shared-mcp.json`.
+1. **Wake-trigger handling in channel server.** Add the file-read-and-replay logic. Test by manually dropping `.wake-trigger.json` in `~/claude-fleet/briefing/` and launching the channel server directly (no dispatcher yet) — confirm Claude sees the message.
+2. **Layout migration.** Move CLAUDE.md, create `~/claude-fleet/briefing/`, write `shared-mcp.json`.
 3. **Dispatcher skeleton.** Subscribe to Zulip narrowed to `#briefing`, log inbounds, no spawning yet. Verify it sees Pete's messages alongside the running bot's MCP.
 4. **Spawn logic.** Add `Bun.spawn` of Claude with full env/cwd/args, write wake-trigger file just before spawn. Test by killing the bot and posting in `#briefing`.
 5. **Supervision.** Track child via `subprocess.exited`; mark DEAD on exit; next inbound respawns.

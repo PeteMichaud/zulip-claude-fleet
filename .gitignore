@@ -11,3 +11,6 @@ HANDOFF.md
 # dispatcher state and wake-trigger files (phase 2.1+)
 state/
 .wake-trigger.json
+
+# shared MCP config has hardcoded local path; copy from .example and customize
+shared-mcp.json
