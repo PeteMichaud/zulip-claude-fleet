@@ -5,7 +5,8 @@
   "private": true,
   "scripts": {
     "ping": "bun run scripts/zulip-ping.ts",
-    "dispatcher": "bun run dispatcher.ts"
+    "dispatcher": "bun run dispatcher.ts",
+    "test": "bun test"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",

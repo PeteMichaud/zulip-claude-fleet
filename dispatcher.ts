@@ -18,6 +18,8 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { makeZulipClient } from './lib/zulip.ts';
+import { parseCommand } from './lib/commands.ts';
+import { humanDuration } from './lib/format.ts';
 
 type Subprocess = ReturnType<typeof Bun.spawn>;
 type WakeTrigger = { stream: string; topic: string; sender: string; content: string };
@@ -341,25 +343,17 @@ async function handleDispatchCommand(msg: any): Promise<void> {
   const topic = msg.subject || 'general';
   log(`dispatch command from owner: ${JSON.stringify(text)}`);
 
-  // Match the documented commands. `@bot` is optional/decorative; bare name works too.
-  const m =
-    text.match(/^(?:spin\s+up|start)\s+@?(\w+)\s*$/i) ?? null;
-  if (m) return cmdSpinUp(topic, m[1]);
-
-  const m2 = text.match(/^(?:shut\s+down|stop|kill)\s+@?(\w+)\s*$/i);
-  if (m2) return cmdShutDown(topic, m2[1]);
-
-  if (/^list(\s+active)?\s*$/i.test(text)) return cmdListActive(topic);
-
-  const m3 = text.match(/^status(?:\s+@?(\w+))?\s*$/i);
-  if (m3) return cmdStatus(topic, m3[1]);
-
-  const m4 = text.match(/^logs?\s+@?(\w+)(?:\s+(\d+))?\s*$/i);
-  if (m4) return cmdLogs(topic, m4[1], m4[2] ? parseInt(m4[2], 10) : 30);
-
-  if (/^help\s*$/i.test(text)) return cmdHelp(topic);
-
-  await postToDispatch(topic, `unrecognized: \`${text}\`. try \`help\`.`);
+  const cmd = parseCommand(text);
+  switch (cmd.kind) {
+    case 'spinUp':     return cmdSpinUp(topic, cmd.target);
+    case 'shutDown':   return cmdShutDown(topic, cmd.target);
+    case 'listActive': return cmdListActive(topic);
+    case 'status':     return cmdStatus(topic, cmd.target);
+    case 'logs':       return cmdLogs(topic, cmd.target, cmd.n);
+    case 'help':       return cmdHelp(topic);
+    case 'unknown':
+      await postToDispatch(topic, `unrecognized: \`${cmd.text}\`. try \`help\`.`);
+  }
 }
 
 async function cmdSpinUp(topic: string, name: string): Promise<void> {
@@ -455,14 +449,6 @@ async function cmdHelp(topic: string): Promise<void> {
   );
 }
 
-function humanDuration(ms: number): string {
-  const s = Math.floor(ms / 1000);
-  if (s < 60) return `${s}s`;
-  const m = Math.floor(s / 60);
-  if (m < 60) return `${m}m${s % 60}s`;
-  const h = Math.floor(m / 60);
-  return `${h}h${m % 60}m`;
-}
 
 // ---------- Main loop ----------
 

@@ -15,6 +15,9 @@ import {
 import { z } from 'zod';
 import { appendFileSync, existsSync, readFileSync, unlinkSync } from 'node:fs';
 import { makeZulipClient } from './lib/zulip.ts';
+import { chunkMessage } from './lib/chunking.ts';
+import { formatPreview } from './lib/format.ts';
+import { isDangerousToolCall, PERMISSION_REPLY_RE } from './lib/permission.ts';
 
 // ---------- Debug log ----------
 // stderr from MCP servers goes somewhere we can't easily find;
@@ -41,18 +44,6 @@ const DEFAULT_TOPIC = 'chat';
 // Where permission prompts get posted. Updated on each inbound message from
 // the owner so prompts appear inline with the active conversation.
 let lastInbound: { stream: string; topic: string } = { stream: HOME_STREAM, topic: DEFAULT_TOPIC };
-
-// Patterns that bypass the tap-to-approve path and require typed verdicts.
-// Checked against `${tool_name} ${input_preview}`.
-const DANGER_PATTERNS: RegExp[] = [
-  /\brm\s+-rf\b/i,
-  /\bgit\s+push\s+.*--force\b/i,
-  /--force-with-lease\b/i,
-  /\bcurl\b[^|]*\|\s*sh\b/i,
-  /\bsudo\b/i,
-  /\bdd\s+if=/i,
-  /\bmkfs\b/i,
-];
 
 // ---------- Zulip API client ----------
 const zulip = makeZulipClient({ site: SITE, email: BOT_EMAIL, apiKey: API_KEY });
@@ -178,20 +169,6 @@ async function readTool(args: { stream: string; limit?: number; anchor?: string 
   return { content: [{ type: 'text', text: formatted || '(no messages)' }] };
 }
 
-function chunkMessage(text: string, maxLen: number): string[] {
-  if (text.length <= maxLen) return [text];
-  const chunks: string[] = [];
-  let remaining = text;
-  while (remaining.length > maxLen) {
-    let cut = remaining.lastIndexOf('\n', maxLen);
-    if (cut < maxLen / 2) cut = maxLen; // no good break, hard-cut
-    chunks.push(remaining.slice(0, cut));
-    remaining = remaining.slice(cut).replace(/^\n+/, '');
-  }
-  if (remaining.length > 0) chunks.push(remaining);
-  return chunks;
-}
-
 // ---------- Permission relay ----------
 // Map: Zulip message id of the prompt -> Claude's request_id
 const pendingPermissions = new Map<string, string>();
@@ -208,8 +185,7 @@ const PermissionRequestSchema = z.object({
 
 mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }) => {
   debug('permission_request:', { id: params.request_id, tool: params.tool_name, desc: params.description });
-  const haystack = `${params.tool_name} ${params.input_preview}`;
-  const dangerous = DANGER_PATTERNS.some((p) => p.test(haystack));
+  const dangerous = isDangerousToolCall(params.tool_name, params.input_preview);
 
   const header = dangerous
     ? `⚠️ **${params.tool_name}** · \`${params.request_id}\` · typed verdict only`
@@ -244,29 +220,6 @@ mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }) => {
     ]).catch((err) => debug('permission relay: pre-react failed (non-fatal):', err.message));
   }
 });
-
-// Render the tool's input_preview as wrapping key-value pairs.
-// Zulip code fences don't soft-wrap, so a long single-line JSON gets horizontally
-// truncated. Inline code (single backticks) wraps on whitespace, so we render
-// each key as bold and each value as inline code on its own line. Falls back to
-// raw inline code if input_preview isn't parseable JSON (e.g. truncated mid-string).
-function formatPreview(s: string): string {
-  try {
-    const obj = JSON.parse(s);
-    if (obj === null || typeof obj !== 'object' || Array.isArray(obj)) {
-      return `\`${s.replace(/`/g, "'")}\``;
-    }
-    return Object.entries(obj)
-      .map(([k, v]) => {
-        const raw = typeof v === 'string' ? v : JSON.stringify(v);
-        const safe = raw.replace(/`/g, "'");
-        return `**${k}**: \`${safe}\``;
-      })
-      .join('\n');
-  } catch {
-    return `\`${s.replace(/`/g, "'")}\``;
-  }
-}
 
 async function emitVerdict(requestId: string, behavior: 'allow' | 'deny') {
   await mcp.notification({
@@ -370,9 +323,6 @@ async function registerQueue() {
   lastEventId = data.last_event_id;
   debug('event queue registered:', queueId);
 }
-
-// `yes abcde` / `no abcde` (case-insensitive, tolerates phone autocorrect)
-const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i;
 
 async function handleMessage(event: any) {
   const msg = event.message;
