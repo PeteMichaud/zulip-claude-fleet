@@ -18,17 +18,33 @@ type WakeTrigger = { stream: string; topic: string; sender: string; content: str
 // ---------- Config ----------
 
 const SITE = mustEnv('ZULIP_SITE');
-const BOT_EMAIL = mustEnv('ZULIP_BOT_EMAIL');
-const API_KEY = mustEnv('ZULIP_API_KEY');
 const OWNER_USER_ID = parseInt(mustEnv('ZULIP_OWNER_USER_ID'), 10);
 
-// Hardcoded registry for 2.1. Multi-bot lands in 2.4.
-type Bot = { name: string; home_stream: string; cwd: string };
+// The dispatcher operates under @dispatch-bot's identity. Its event queue
+// gets messages from every stream dispatch-bot is subscribed to (its own
+// home stream + every bot's home stream).
+const DISPATCH_BOT_EMAIL = mustEnv('DISPATCH_BOT_EMAIL');
+const DISPATCH_BOT_API_KEY = mustEnv('DISPATCH_BOT_API_KEY');
+const DISPATCH_STREAM = mustEnv('DISPATCH_STREAM');
+
+// Per-bot record. `bot_email` / `bot_api_key` are the credentials *that bot's*
+// channel server uses (injected at spawn time), distinct from dispatch-bot.
+type Bot = {
+  name: string;
+  home_stream: string;
+  cwd: string;
+  bot_email: string;
+  bot_api_key: string;
+};
+
+// Hardcoded registry for 2.2. Multi-bot lands in 2.4.
 const REGISTRY: Record<string, Bot> = {
   briefing: {
     name: 'briefing',
     home_stream: 'briefing',
     cwd: '/Users/pete/claude-fleet/briefing',
+    bot_email: mustEnv('ZULIP_BOT_EMAIL'),
+    bot_api_key: mustEnv('ZULIP_API_KEY'),
   },
 };
 
@@ -50,7 +66,7 @@ function log(...parts: unknown[]) {
 
 // ---------- Zulip API helper ----------
 
-const ZAUTH = 'Basic ' + Buffer.from(`${BOT_EMAIL}:${API_KEY}`).toString('base64');
+const ZAUTH = 'Basic ' + Buffer.from(`${DISPATCH_BOT_EMAIL}:${DISPATCH_BOT_API_KEY}`).toString('base64');
 
 async function zulip(
   path: string,
@@ -135,24 +151,19 @@ let queueId: string | undefined;
 let lastEventId = -1;
 
 async function registerQueue() {
-  const streams = Object.values(REGISTRY).map((b) => b.home_stream);
-  if (streams.length !== 1) {
-    // Multi-stream narrows aren't a single OR'd narrow in Zulip — would need
-    // either no narrow + client-side filtering, or one queue per stream.
-    // 2.1 is single-bot, so this is fine; revisit in 2.4.
-    throw new Error(`registry must have exactly one bot in 2.1, got ${streams.length}`);
-  }
+  // No stream narrow: dispatch-bot is subscribed to its own stream + every
+  // bot's home stream, so its queue gets exactly the messages we care about.
+  // Stream-based routing happens in handleMessage.
   const data = await zulip('/register', {
     method: 'POST',
     params: {
       event_types: ['message'],
-      narrow: [['stream', streams[0]]],
       apply_markdown: false,
     },
   });
   queueId = data.queue_id;
   lastEventId = data.last_event_id;
-  log(`event queue registered: ${queueId} (narrowed to stream "${streams[0]}")`);
+  log(`event queue registered: ${queueId}`);
 }
 
 // ---------- Process supervision ----------
@@ -167,6 +178,7 @@ async function registerQueue() {
 // child's PTY, and forwards the exit code.
 const runningBots = new Map<string, Subprocess>();
 const spawnLocks = new Map<string, Promise<unknown>>();
+const startTimes = new Map<string, number>(); // botName -> ms timestamp at spawn
 
 function isAlive(botName: string): boolean {
   const child = runningBots.get(botName);
@@ -200,6 +212,12 @@ async function spawnBot(bot: Bot, trigger: WakeTrigger): Promise<void> {
     env: {
       ...process.env,
       CLAUDE_CONFIG_DIR: CLAUDE_CONFIG_DIR_DEFAULT,
+      // Inject this bot's own creds — channel server reads ZULIP_BOT_EMAIL /
+      // ZULIP_API_KEY / ZULIP_HOME_STREAM and would otherwise inherit
+      // dispatch-bot's creds from process.env.
+      ZULIP_BOT_EMAIL: bot.bot_email,
+      ZULIP_API_KEY: bot.bot_api_key,
+      ZULIP_HOME_STREAM: bot.home_stream,
     },
     stdin: 'pipe',
     stdout: 'pipe',
@@ -208,6 +226,7 @@ async function spawnBot(bot: Bot, trigger: WakeTrigger): Promise<void> {
 
   log(`spawned @${bot.name}: pid=${child.pid} cwd=${bot.cwd}`);
   runningBots.set(bot.name, child);
+  startTimes.set(bot.name, Date.now());
 
   // Pump child stdout + stderr to the per-bot log. Any error in the pump
   // (e.g. stream closed during shutdown) is non-fatal.
@@ -230,6 +249,7 @@ async function spawnBot(bot: Bot, trigger: WakeTrigger): Promise<void> {
   // in the .then callback (which would otherwise crash the dispatcher).
   child.exited.then(async (exitCode) => {
     runningBots.delete(bot.name);
+    startTimes.delete(bot.name);
     log(`@${bot.name} exited (code ${exitCode})`);
     try {
       await logWriter.flush();
@@ -287,6 +307,14 @@ async function handleMessage(event: any) {
   if (msg.sender_id !== OWNER_USER_ID) return; // only owner messages count
 
   const stream = typeof msg.display_recipient === 'string' ? msg.display_recipient : '';
+
+  // Route by stream: #Dispatch is for fleet-ops commands; bot home streams
+  // are wake-up triggers; anything else we ignore.
+  if (stream === DISPATCH_STREAM) {
+    await handleDispatchCommand(msg);
+    return;
+  }
+
   const bot = botForStream(stream);
   if (!bot) {
     log(`inbound in unregistered stream "${stream}", ignoring`);
@@ -306,7 +334,6 @@ async function handleMessage(event: any) {
     return;
   }
 
-  // Bot is sleeping — wake it. Pass this message as the bootstrap.
   const trigger: WakeTrigger = {
     stream,
     topic: msg.subject || 'chat',
@@ -314,6 +341,147 @@ async function handleMessage(event: any) {
     content: msg.content ?? '',
   };
   await maybeSpawn(bot, trigger);
+}
+
+// ---------- Fleet-ops commands ----------
+
+async function postToDispatch(topic: string, content: string): Promise<void> {
+  try {
+    await zulip('/messages', {
+      method: 'POST',
+      params: { type: 'stream', to: DISPATCH_STREAM, topic, content },
+    });
+  } catch (err: any) {
+    log(`failed to post to #${DISPATCH_STREAM}: ${err.message}`);
+  }
+}
+
+async function handleDispatchCommand(msg: any): Promise<void> {
+  const text = String(msg.content ?? '').trim();
+  const topic = msg.subject || 'general';
+  log(`dispatch command from owner: ${JSON.stringify(text)}`);
+
+  // Match the documented commands. `@bot` is optional/decorative; bare name works too.
+  const m =
+    text.match(/^(?:spin\s+up|start)\s+@?(\w+)\s*$/i) ?? null;
+  if (m) return cmdSpinUp(topic, m[1]);
+
+  const m2 = text.match(/^(?:shut\s+down|stop|kill)\s+@?(\w+)\s*$/i);
+  if (m2) return cmdShutDown(topic, m2[1]);
+
+  if (/^list(\s+active)?\s*$/i.test(text)) return cmdListActive(topic);
+
+  const m3 = text.match(/^status(?:\s+@?(\w+))?\s*$/i);
+  if (m3) return cmdStatus(topic, m3[1]);
+
+  const m4 = text.match(/^logs?\s+@?(\w+)(?:\s+(\d+))?\s*$/i);
+  if (m4) return cmdLogs(topic, m4[1], m4[2] ? parseInt(m4[2], 10) : 30);
+
+  if (/^help\s*$/i.test(text)) return cmdHelp(topic);
+
+  await postToDispatch(topic, `unrecognized: \`${text}\`. try \`help\`.`);
+}
+
+async function cmdSpinUp(topic: string, name: string): Promise<void> {
+  const bot = REGISTRY[name];
+  if (!bot) return postToDispatch(topic, `no bot named \`${name}\` in registry`);
+  if (isAlive(bot.name)) return postToDispatch(topic, `@${bot.name} is already running`);
+
+  const trigger: WakeTrigger = {
+    stream: bot.home_stream,
+    topic: 'chat',
+    sender: 'dispatch',
+    content: `(spawned via @dispatch spin up — say hello in #${bot.home_stream} when you're ready)`,
+  };
+  await maybeSpawn(bot, trigger);
+  await postToDispatch(topic, `spinning up @${bot.name}`);
+}
+
+async function cmdShutDown(topic: string, name: string): Promise<void> {
+  const bot = REGISTRY[name];
+  if (!bot) return postToDispatch(topic, `no bot named \`${name}\` in registry`);
+  const child = runningBots.get(bot.name);
+  if (!child) return postToDispatch(topic, `@${bot.name} is not running`);
+  try {
+    child.kill('SIGTERM');
+    await postToDispatch(topic, `sent SIGTERM to @${bot.name} (pid ${child.pid})`);
+  } catch (err: any) {
+    await postToDispatch(topic, `failed to kill @${bot.name}: ${err.message}`);
+  }
+}
+
+async function cmdListActive(topic: string): Promise<void> {
+  if (runningBots.size === 0) return postToDispatch(topic, 'no bots currently running');
+  const lines = ['**Running bots:**'];
+  for (const [name, child] of runningBots) {
+    const startedAt = startTimes.get(name);
+    const uptime = startedAt ? humanDuration(Date.now() - startedAt) : '?';
+    lines.push(`- @${name}: pid ${child.pid}, uptime ${uptime}`);
+  }
+  await postToDispatch(topic, lines.join('\n'));
+}
+
+async function cmdStatus(topic: string, name: string | undefined): Promise<void> {
+  const targets = name ? [name] : Object.keys(REGISTRY);
+  const lines: string[] = [];
+  for (const n of targets) {
+    const bot = REGISTRY[n];
+    if (!bot) {
+      lines.push(`- \`${n}\`: not in registry`);
+      continue;
+    }
+    const state = readState(bot.name);
+    const alive = isAlive(bot.name);
+    const child = runningBots.get(bot.name);
+    const startedAt = startTimes.get(bot.name);
+    const uptime = startedAt && alive ? humanDuration(Date.now() - startedAt) : null;
+    const lastActive = state.last_active ?? 'never';
+    lines.push(
+      `- @${bot.name}: ${alive ? `**alive** (pid ${child?.pid}, up ${uptime})` : 'sleeping'}; last_active ${lastActive}`,
+    );
+  }
+  await postToDispatch(topic, lines.join('\n'));
+}
+
+async function cmdLogs(topic: string, name: string, n: number): Promise<void> {
+  const bot = REGISTRY[name];
+  if (!bot) return postToDispatch(topic, `no bot named \`${name}\` in registry`);
+  const path = join(LOG_DIR, `${bot.name}.log`);
+  if (!existsSync(path)) return postToDispatch(topic, `no log file for @${bot.name} yet`);
+  let lines: string[];
+  try {
+    lines = readFileSync(path, 'utf-8').split('\n');
+  } catch (err: any) {
+    return postToDispatch(topic, `couldn't read log: ${err.message}`);
+  }
+  const tail = lines.slice(-n).join('\n');
+  // Strip ANSI escape sequences so the Zulip post is readable.
+  const stripped = tail.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '');
+  await postToDispatch(topic, `**last ${n} lines of @${bot.name}:**\n\`\`\`\n${stripped.slice(-7000)}\n\`\`\``);
+}
+
+async function cmdHelp(topic: string): Promise<void> {
+  await postToDispatch(
+    topic,
+    [
+      '**Fleet-ops commands** (post in #' + DISPATCH_STREAM + '):',
+      '- `spin up @<bot>` — start that bot',
+      '- `shut down @<bot>` — kill that bot',
+      '- `list active` — running bots + uptime',
+      '- `status [@<bot>]` — alive/sleeping + last activity (all bots if no name)',
+      '- `logs @<bot> [n]` — last n lines of bot stdout/stderr (default 30)',
+      '- `help` — this',
+    ].join('\n'),
+  );
+}
+
+function humanDuration(ms: number): string {
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m${s % 60}s`;
+  const h = Math.floor(m / 60);
+  return `${h}h${m % 60}m`;
 }
 
 // ---------- Main loop ----------
