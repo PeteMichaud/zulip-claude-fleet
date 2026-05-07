@@ -2,8 +2,9 @@ import { describe, expect, test } from 'bun:test';
 import { parseCommand } from './commands.ts';
 
 describe('parseCommand', () => {
-  test('spin up', () => {
+  test('spin up (space or hyphen between words)', () => {
     expect(parseCommand('spin up briefing')).toEqual({ kind: 'spinUp', target: 'briefing' });
+    expect(parseCommand('spin-up briefing')).toEqual({ kind: 'spinUp', target: 'briefing' });
     expect(parseCommand('spin up @briefing')).toEqual({ kind: 'spinUp', target: 'briefing' });
     expect(parseCommand('SPIN UP briefing')).toEqual({ kind: 'spinUp', target: 'briefing' });
     expect(parseCommand('start briefing')).toEqual({ kind: 'spinUp', target: 'briefing' });
@@ -15,16 +16,32 @@ describe('parseCommand', () => {
     expect(parseCommand('Reset briefing')).toEqual({ kind: 'reset', target: 'briefing' });
   });
 
-  test('shut down (multiple synonyms)', () => {
+  test('create-bot (variants)', () => {
+    expect(parseCommand('create-bot writer')).toEqual({ kind: 'createBot', target: 'writer' });
+    expect(parseCommand('create bot writer')).toEqual({ kind: 'createBot', target: 'writer' });
+    expect(parseCommand('createbot writer')).toEqual({ kind: 'createBot', target: 'writer' });
+    expect(parseCommand('CREATE-BOT writer')).toEqual({ kind: 'createBot', target: 'writer' });
+    expect(parseCommand('create-bot @writer')).toEqual({ kind: 'createBot', target: 'writer' });
+    expect(parseCommand('create-bot test-bot-1')).toEqual({ kind: 'createBot', target: 'test-bot-1' });
+  });
+
+  test('retire', () => {
+    expect(parseCommand('retire writer')).toEqual({ kind: 'retire', target: 'writer' });
+    expect(parseCommand('retire @writer')).toEqual({ kind: 'retire', target: 'writer' });
+  });
+
+  test('shut down (synonyms, hyphen-or-space between words)', () => {
     expect(parseCommand('shut down briefing')).toEqual({ kind: 'shutDown', target: 'briefing' });
-    expect(parseCommand('shut  down  briefing')).toEqual({ kind: 'shutDown', target: 'briefing' }); // multi-space tolerant
+    expect(parseCommand('shut-down briefing')).toEqual({ kind: 'shutDown', target: 'briefing' });
+    expect(parseCommand('shut  down  briefing')).toEqual({ kind: 'shutDown', target: 'briefing' });
     expect(parseCommand('stop briefing')).toEqual({ kind: 'shutDown', target: 'briefing' });
     expect(parseCommand('kill @briefing')).toEqual({ kind: 'shutDown', target: 'briefing' });
   });
 
-  test('list active', () => {
+  test('list active (hyphen-or-space)', () => {
     expect(parseCommand('list')).toEqual({ kind: 'listActive' });
     expect(parseCommand('list active')).toEqual({ kind: 'listActive' });
+    expect(parseCommand('list-active')).toEqual({ kind: 'listActive' });
     expect(parseCommand('LIST ACTIVE')).toEqual({ kind: 'listActive' });
   });
 

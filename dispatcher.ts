@@ -46,16 +46,52 @@ type Bot = {
   bot_api_key: string;
 };
 
-// Hardcoded registry for 2.2. Multi-bot lands in 2.4.
-const REGISTRY: Record<string, Bot> = {
-  briefing: {
-    name: 'briefing',
-    home_stream: 'briefing',
-    cwd: '/Users/pete/claude-fleet/briefing',
-    bot_email: mustEnv('ZULIP_BOT_EMAIL'),
-    bot_api_key: mustEnv('ZULIP_API_KEY'),
-  },
-};
+// Bot working trees live under this directory. create-bot mkdirs
+// <FLEET_ROOT>/<name>; retire moves it to <FLEET_ROOT>/_retired/<ts>_<name>.
+const FLEET_ROOT = join(process.env.HOME ?? '', 'claude-fleet');
+const RETIRED_ROOT = join(FLEET_ROOT, '_retired');
+
+// Registry is persisted at state/registry.json. Loaded once at startup,
+// rewritten on every mutation (create-bot, retire). On first run it's
+// seeded from the legacy ZULIP_BOT_* env vars to migrate phase-1 setups.
+const REGISTRY_PATH = join(import.meta.dir, 'state', 'registry.json');
+
+function loadRegistry(): Record<string, Bot> {
+  if (existsSync(REGISTRY_PATH)) {
+    try {
+      return JSON.parse(readFileSync(REGISTRY_PATH, 'utf-8'));
+    } catch (err: any) {
+      throw new Error(`failed to parse ${REGISTRY_PATH}: ${err.message}`);
+    }
+  }
+  // First run: seed from legacy env. Existing phase-1 setups have a single
+  // briefing-shaped bot configured via ZULIP_BOT_* env vars.
+  const legacyEmail = process.env.ZULIP_BOT_EMAIL;
+  const legacyKey = process.env.ZULIP_API_KEY;
+  const legacyStream = process.env.ZULIP_HOME_STREAM;
+  if (legacyEmail && legacyKey && legacyStream) {
+    const seeded: Record<string, Bot> = {
+      [legacyStream]: {
+        name: legacyStream,
+        home_stream: legacyStream,
+        cwd: join(FLEET_ROOT, legacyStream),
+        bot_email: legacyEmail,
+        bot_api_key: legacyKey,
+      },
+    };
+    saveRegistry(seeded);
+    return seeded;
+  }
+  return {};
+}
+
+function saveRegistry(reg: Record<string, Bot>): void {
+  const tmp = `${REGISTRY_PATH}.tmp`;
+  writeFileSync(tmp, JSON.stringify(reg, null, 2) + '\n');
+  renameSync(tmp, REGISTRY_PATH);
+}
+
+const REGISTRY: Record<string, Bot> = loadRegistry();
 
 const STATE_DIR = join(import.meta.dir, 'state');
 const LOG_DIR = join(STATE_DIR, 'logs');
@@ -73,13 +109,25 @@ function log(...parts: unknown[]) {
   console.log(line);
 }
 
-// ---------- Zulip API client ----------
+// ---------- Zulip API clients ----------
 
+// `zulip` is dispatch-bot's identity — used for nearly everything. Its event
+// queue, posts in #Dispatch, stream/user lookups, deactivations, archivals.
 const zulip = makeZulipClient({
   site: SITE,
   email: DISPATCH_BOT_EMAIL,
   apiKey: DISPATCH_BOT_API_KEY,
 });
+
+// `zulipAsOwner` is the owner's (Pete's) identity. Needed only for endpoints
+// that explicitly reject bot callers — namely `/bots` for creating new bot
+// users. Optional at startup; if OWNER_API_KEY isn't in .env, create-bot
+// fails at command time with a clear message rather than blocking startup.
+const OWNER_EMAIL = process.env.OWNER_EMAIL;
+const OWNER_API_KEY = process.env.OWNER_API_KEY;
+const zulipAsOwner = OWNER_EMAIL && OWNER_API_KEY
+  ? makeZulipClient({ site: SITE, email: OWNER_EMAIL, apiKey: OWNER_API_KEY })
+  : null;
 
 // ---------- Session-storage discovery ----------
 
@@ -337,16 +385,18 @@ function botForStream(stream: string): Bot | undefined {
 
 async function handleMessage(event: any) {
   const msg = event.message;
-  if (msg.sender_id !== OWNER_USER_ID) return; // only owner messages count
-
   const stream = typeof msg.display_recipient === 'string' ? msg.display_recipient : '';
 
-  // Route by stream: #Dispatch is for fleet-ops commands; bot home streams
-  // are wake-up triggers; anything else we ignore.
+  // #Dispatch: fleet-ops commands. Owner can do anything; bots can issue
+  // self-targeted commands (so a bot can ask to be reset after editing
+  // its own CLAUDE.md, etc.). Sender filtering happens inside.
   if (stream === DISPATCH_STREAM) {
     await handleDispatchCommand(msg);
     return;
   }
+
+  // Bot home streams: wake-up logic, owner-only.
+  if (msg.sender_id !== OWNER_USER_ID) return;
 
   const bot = botForStream(stream);
   if (!bot) {
@@ -376,6 +426,12 @@ async function handleMessage(event: any) {
   await maybeSpawn(bot, trigger);
 }
 
+// Find a bot in the registry whose Zulip identity sent this message.
+// Used to allow bots to issue self-targeted commands in #Dispatch.
+function botFromSender(senderEmail: string): Bot | undefined {
+  return Object.values(REGISTRY).find((b) => b.bot_email === senderEmail);
+}
+
 // ---------- Fleet-ops commands ----------
 
 async function postToDispatch(topic: string, content: string): Promise<void> {
@@ -392,13 +448,43 @@ async function postToDispatch(topic: string, content: string): Promise<void> {
 async function handleDispatchCommand(msg: any): Promise<void> {
   const text = String(msg.content ?? '').trim();
   const topic = msg.subject || 'general';
-  log(`dispatch command from owner: ${JSON.stringify(text)}`);
+  const senderEmail = String(msg.sender_email ?? '');
+
+  // Filter our own posts silently — dispatch-bot's queue receives the messages
+  // it itself sends (since it's subscribed to #Dispatch).
+  if (senderEmail === DISPATCH_BOT_EMAIL) return;
+
+  // Identify the sender. Owner gets full command access; a registered bot
+  // gets a self-restricted subset (so it can request its own reset/shutdown
+  // after self-modification). Anyone else is ignored silently.
+  const isOwner = msg.sender_id === OWNER_USER_ID;
+  const issuingBot = isOwner ? undefined : botFromSender(senderEmail);
+  if (!isOwner && !issuingBot) {
+    log(`#${DISPATCH_STREAM} message from unknown sender ${senderEmail} — ignored`);
+    return;
+  }
+
+  log(`dispatch command from ${isOwner ? 'owner' : `@${issuingBot!.name}`}: ${JSON.stringify(text)}`);
 
   const cmd = parseCommand(text);
+
+  // Bot senders are restricted to self-targeted reset / shutDown only.
+  if (issuingBot) {
+    const target = (cmd as { target?: string }).target;
+    const allowed =
+      (cmd.kind === 'reset' || cmd.kind === 'shutDown') &&
+      target === issuingBot.name;
+    if (!allowed) {
+      log(`@${issuingBot.name} unauthorized: ${cmd.kind} ${target ?? ''} — ignored`);
+      return;
+    }
+  }
   switch (cmd.kind) {
     case 'spinUp':     return cmdSpinUp(topic, cmd.target);
     case 'shutDown':   return cmdShutDown(topic, cmd.target);
     case 'reset':      return cmdReset(topic, cmd.target);
+    case 'createBot':  return cmdCreateBot(topic, cmd.target);
+    case 'retire':     return cmdRetire(topic, cmd.target);
     case 'listActive': return cmdListActive(topic);
     case 'status':     return cmdStatus(topic, cmd.target);
     case 'logs':       return cmdLogs(topic, cmd.target, cmd.n);
@@ -468,6 +554,274 @@ async function cmdReset(topic: string, name: string): Promise<void> {
   );
 }
 
+// Provision a new bot end-to-end. Bot creation goes through the owner's
+// credentials because Zulip's /bots endpoint rejects bot callers; everything
+// else uses dispatch-bot.
+async function cmdCreateBot(topic: string, name: string): Promise<void> {
+  if (!/^[a-z][a-z0-9_-]*$/.test(name)) {
+    return postToDispatch(topic, `invalid name \`${name}\` — must start with a lowercase letter and contain only [a-z0-9_-]`);
+  }
+  if (REGISTRY[name]) {
+    return postToDispatch(topic, `\`${name}\` already in registry; pick a different name or \`retire\` it first`);
+  }
+  if (!zulipAsOwner) {
+    return postToDispatch(
+      topic,
+      `OWNER_API_KEY not configured. Add OWNER_EMAIL and OWNER_API_KEY to .env (your personal user creds) so the dispatcher can create bot users on your behalf.`,
+    );
+  }
+
+  await postToDispatch(topic, `creating @${name}…`);
+
+  // Step 1: create the bot user via the owner's account. /bots rejects
+  // bot callers, so we use Pete's user creds for this one call only.
+  let botUser: { user_id: number; email: string; api_key: string };
+  try {
+    const created = await zulipAsOwner('/bots', {
+      method: 'POST',
+      params: {
+        full_name: `${name}-bot`,
+        short_name: `${name}-bot`,
+        bot_type: 1, // generic
+      },
+    });
+    if (typeof created.user_id !== 'number' || !created.api_key) {
+      throw new Error(`unexpected /bots response: ${JSON.stringify(created)}`);
+    }
+    // /bots response in some Zulip versions omits `email`; look it up
+    // explicitly via /users/{id} to get the authoritative record.
+    const userInfo = await zulip(`/users/${created.user_id}`);
+    const email = userInfo.user?.email;
+    if (typeof email !== 'string' || email.length === 0) {
+      throw new Error(`bot created (user_id ${created.user_id}) but /users lookup returned no email`);
+    }
+    botUser = { user_id: created.user_id, email, api_key: created.api_key };
+    log(`@${name}: created bot user (user_id ${botUser.user_id}, email ${botUser.email})`);
+  } catch (err: any) {
+    return postToDispatch(topic, `failed to create bot user: ${err.message}`);
+  }
+
+  // Step 2: create the home stream and subscribe owner + new bot. Zulip
+  // auto-subscribes the caller (dispatch-bot here, since `zulip` is its client).
+  try {
+    await zulip('/users/me/subscriptions', {
+      method: 'POST',
+      params: {
+        subscriptions: [{ name }],
+        principals: [OWNER_USER_ID, botUser.user_id],
+      },
+    });
+    log(`@${name}: stream #${name} ready, subscribers include owner + new bot + dispatch-bot`);
+  } catch (err: any) {
+    return postToDispatch(
+      topic,
+      `bot user created but stream creation failed: ${err.message}. orphan bot user_id=${botUser.user_id}, email=${botUser.email} — deactivate manually or call \`retire\` after manually adding it to the registry`,
+    );
+  }
+
+  // Step 3: scaffold the working tree.
+  const cwd = join(FLEET_ROOT, name);
+  try {
+    mkdirSync(cwd, { recursive: true });
+    mkdirSync(join(cwd, '.claude'), { recursive: true });
+    writeFileSync(join(cwd, 'CLAUDE.md'), claudeMdStub(name));
+    writeFileSync(
+      join(cwd, '.claude', 'settings.local.json'),
+      JSON.stringify({ permissions: { allow: ['mcp__zulip-channel__*'] } }, null, 2) + '\n',
+    );
+    log(`@${name}: scaffolded working tree at ${cwd}`);
+  } catch (err: any) {
+    return postToDispatch(topic, `stream OK but working tree scaffold failed: ${err.message}`);
+  }
+
+  // Step 3.5: pre-mark the directory as trusted in CLAUDE_CONFIG_DIR/.claude.json.
+  // Without this, the spawned Claude shows a workspace-trust dialog at startup
+  // ("Is this a project you created or trust?") in addition to the
+  // --dangerously-load-development-channels warning. Our auto-Enter only fires
+  // once, so the channels dialog ends up un-dismissed and the bot hangs.
+  try {
+    pretrustDirectory(cwd);
+    log(`@${name}: pre-trusted ${cwd}`);
+  } catch (err: any) {
+    log(`@${name}: pre-trust failed (non-fatal — first spawn may show trust dialog): ${err.message}`);
+  }
+
+  // Step 4: register and persist.
+  REGISTRY[name] = {
+    name,
+    home_stream: name,
+    cwd,
+    bot_email: botUser.email,
+    bot_api_key: botUser.api_key,
+  };
+  saveRegistry(REGISTRY);
+
+  await postToDispatch(
+    topic,
+    [
+      `✓ @${name} created`,
+      `- bot user: \`${botUser.email}\` (user_id ${botUser.user_id})`,
+      `- home stream: \`#${name}\``,
+      `- working tree: \`${cwd}\` — \`spin up ${name}\` and tell it what kind of bot to be`,
+    ].join('\n'),
+  );
+}
+
+// Mark `cwd` as trusted in CLAUDE_CONFIG_DIR/.claude.json so the workspace-trust
+// dialog doesn't appear on first spawn. Read-modify-atomic-rename to minimize
+// races with other Claude processes that update the same file.
+function pretrustDirectory(cwd: string): void {
+  const path = join(CLAUDE_CONFIG_DIR_DEFAULT, '.claude.json');
+  let data: any = {};
+  if (existsSync(path)) {
+    try {
+      data = JSON.parse(readFileSync(path, 'utf-8'));
+    } catch (err: any) {
+      throw new Error(`couldn't parse ${path}: ${err.message}`);
+    }
+  }
+  if (!data.projects || typeof data.projects !== 'object') data.projects = {};
+  if (!data.projects[cwd] || typeof data.projects[cwd] !== 'object') {
+    data.projects[cwd] = {};
+  }
+  data.projects[cwd].hasTrustDialogAccepted = true;
+  data.projects[cwd].hasCompletedProjectOnboarding = true;
+
+  const tmp = `${path}.tmp.${process.pid}`;
+  writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n');
+  renameSync(tmp, path);
+}
+
+function claudeMdStub(name: string): string {
+  return `# ${name}-bot
+
+You are a Claude session reachable via the Zulip stream \`#${name}\`. Your operator is Pete.
+
+This file is the **stub** that the dispatcher wrote when it provisioned you. Pete is going to tell you what kind of bot you should be — your role, scope, conventions, what tools to use freely, what to ask permission for. When he does, edit this file (the \`## Your scope\` section especially) so the new persona persists across sessions. After you've made the edit, ask the dispatcher to reset you so the next session starts with the new identity:
+
+\`\`\`
+send(stream="Dispatch", text="reset ${name}")
+\`\`\`
+
+The dispatcher will kill this session, clear your stored conversation, and the next time Pete writes to you, you'll wake up fresh with the new CLAUDE.md as your identity.
+
+## How you're wired up
+
+- Messages from Pete arrive as \`<channel source="zulip-channel" stream="${name}" topic="..." sender="...">\` events.
+- You reply by calling the \`send\` tool. Default destination is the same stream and topic as the inbound message.
+- You can read history from any stream you have access to via the \`read\` tool.
+- Tool calls that need permission (Bash, Write, Edit) are relayed to Zulip; Pete taps a ✅ reaction or replies \`yes <id>\`.
+- You can post in \`#Dispatch\` to issue self-targeted lifecycle commands: \`reset ${name}\` (above) or \`shut down ${name}\` (just sleep, will resume when Pete writes to you next).
+
+## Your scope
+
+*(Pete to fill in — this is a placeholder.)*
+
+- This bot is for:
+- Conventions / preferences:
+- Tools to use freely:
+- Tools to ask before using:
+
+## Communication style
+
+- Replies appear as Zulip messages. Keep them short and direct unless asked otherwise.
+- Markdown renders in Zulip — code fences, headings, lists all work.
+- For long outputs the \`send\` tool chunks automatically; don't try to hand-chunk.
+- Check for \`HANDOFF.md\` in this directory at session start; it contains your prior self's notes if there's been a previous session.
+`;
+}
+
+// Retire a bot: kill if running, deactivate the Zulip bot user, archive the
+// stream, remove from registry. Working tree on disk is preserved (Pete can
+// rm -rf manually if he wants — by default we keep history).
+async function cmdRetire(topic: string, name: string): Promise<void> {
+  const bot = REGISTRY[name];
+  if (!bot) return postToDispatch(topic, `no bot named \`${name}\` in registry`);
+
+  await postToDispatch(topic, `retiring @${name}…`);
+
+  // Step 1: kill if running.
+  const child = runningBots.get(bot.name);
+  if (child) {
+    try {
+      child.kill('SIGTERM');
+      await Promise.race([
+        child.exited,
+        new Promise((r) => setTimeout(r, 5000)),
+      ]);
+    } catch (err: any) {
+      log(`@${bot.name} retire: kill failed: ${err.message}`);
+    }
+  }
+
+  // Step 2: look up the bot's user_id from Zulip. If bot_email is missing
+  // (e.g. broken registry entry from an earlier failed create-bot), we look
+  // up by stream subscribers as a fallback, or skip user deactivation.
+  let userId: number | null = null;
+  if (bot.bot_email) {
+    try {
+      const res = await zulip(`/users/${encodeURIComponent(bot.bot_email)}`);
+      userId = res.user?.user_id ?? null;
+    } catch (err: any) {
+      log(`@${bot.name} retire: couldn't look up user_id: ${err.message}`);
+    }
+  } else {
+    log(`@${bot.name} retire: bot_email missing from registry — skipping user lookup`);
+  }
+
+  // Step 3: deactivate the bot user. Reversible; preserves history.
+  if (userId !== null) {
+    try {
+      await zulip(`/users/${userId}`, { method: 'DELETE' });
+      log(`@${bot.name} retire: deactivated user_id ${userId}`);
+    } catch (err: any) {
+      log(`@${bot.name} retire: deactivation failed: ${err.message}`);
+    }
+  }
+
+  // Step 4: archive the stream. Reversible by an admin; messages preserved.
+  try {
+    const streams = await zulip('/streams');
+    const stream = (streams.streams as any[]).find((s) => s.name === bot.home_stream);
+    if (stream) {
+      await zulip(`/streams/${stream.stream_id}`, { method: 'DELETE' });
+      log(`@${bot.name} retire: archived stream #${bot.home_stream} (id ${stream.stream_id})`);
+    }
+  } catch (err: any) {
+    log(`@${bot.name} retire: stream archive failed: ${err.message}`);
+  }
+
+  // Step 5: remove from registry, persist.
+  delete REGISTRY[name];
+  saveRegistry(REGISTRY);
+
+  // Step 6: move the working tree under _retired/ so the main fleet dir
+  // stays clean. Timestamped so re-creating + re-retiring the same name
+  // doesn't clobber prior archives. Manual un-retire = mv back.
+  let archivedPath: string | null = null;
+  if (existsSync(bot.cwd)) {
+    try {
+      mkdirSync(RETIRED_ROOT, { recursive: true });
+      // ISO timestamp with colons replaced for FS-safety: 2026-05-07T20-58-30Z
+      const ts = new Date().toISOString().replace(/:/g, '-').replace(/\.\d+/, '');
+      archivedPath = join(RETIRED_ROOT, `${ts}_${name}`);
+      renameSync(bot.cwd, archivedPath);
+      log(`@${bot.name} retire: moved working tree to ${archivedPath}`);
+    } catch (err: any) {
+      log(`@${bot.name} retire: failed to archive working tree: ${err.message}`);
+      archivedPath = null;
+    }
+  }
+
+  const archiveLine = archivedPath
+    ? `Working tree archived to \`${archivedPath}\` — \`mv\` it back to unretire.`
+    : `Working tree at \`${bot.cwd}\` left in place (archive failed; rm or move manually).`;
+  await postToDispatch(
+    topic,
+    `✓ @${name} retired (bot deactivated, stream archived, registry cleared). ${archiveLine}`,
+  );
+}
+
 async function cmdListActive(topic: string): Promise<void> {
   if (runningBots.size === 0) return postToDispatch(topic, 'no bots currently running');
   const lines = ['**Running bots:**'];
@@ -526,6 +880,8 @@ async function cmdHelp(topic: string): Promise<void> {
       '- `spin up @<bot>` — start that bot (resumes prior session if known)',
       '- `shut down @<bot>` — kill that bot (next start will resume)',
       '- `reset @<bot>` — kill and clear stored session; next start is fresh',
+      '- `create-bot <name>` — provision a new bot end-to-end (Zulip user via owner creds, stream, working tree, registry)',
+      '- `retire <name>` — kill, deactivate Zulip bot, archive stream, remove from registry',
       '- `list active` — running bots + uptime',
       '- `status [@<bot>]` — alive/sleeping + last activity (all bots if no name)',
       '- `logs @<bot> [n]` — last n lines of bot stdout/stderr (default 30)',

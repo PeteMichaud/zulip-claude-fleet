@@ -140,11 +140,74 @@ Then `/forget`, exit, restart. The handoff should now be archived under `.handof
 - **Channel doesn't register:** Claude Code prints a startup notice. Most likely you forgot `--dangerously-load-development-channels` (custom channels need that flag during research preview).
 - **Permission relay times out / hangs:** known phase-1 limitation (no auto-deny). React or hard-restart.
 
-## What's next (not phase 1)
+## Phase 2 setup (one-time, after phase 1 works)
 
-- **Phase 2** is built in four end-to-end testable slices (see SPEC.md for details):
-  - **2.1** — dispatcher daemon that wakes one hardcoded bot.
-  - **2.2** — `@dispatch` Zulip bot for lifecycle commands (`spin up`, `shut down`, `list active`, etc.).
-  - **2.3** — `--resume` + `HANDOFF.md` for memory across sleep/wake; adds `compact` and `reset`.
-  - **2.4** — multi-bot fleet, `create-bot` provisioning, per-bot variation.
-- **Phase 3** — inter-bot summoning via @-mentions, fleet roster, loop hazard handling. See SPEC.md.
+Phase 2 introduces the dispatcher (a long-running supervisor process) and a `#Dispatch` stream for fleet-ops commands. One-time provisioning before anything in 2.1+ works:
+
+### 1. Create dispatch-bot **[Pete]**
+
+In Zulip: **Personal Settings → Bots → Add a new bot**. Type: **Generic bot**. Name it `dispatch` (the bot's full email becomes `dispatch-bot@<your-realm>.zulipchat.com`). Save the email + API key.
+
+### 2. Promote dispatch-bot to organization admin **[Pete]**
+
+The dispatcher uses dispatch-bot's identity to create streams with multi-user subscriptions, deactivate retired bots, and archive their streams. Those endpoints need admin role.
+
+In Zulip: **Settings → Manage organization → Users → dispatch-bot → Edit → Role** → set to **Organization administrator** (or **Owner**). Save.
+
+Important caveat: even with admin role, **bot users cannot create other bot users** — Zulip's `/bots` endpoint explicitly rejects bot callers. So the dispatcher uses the *owner's* (your personal) API key for that one specific call (see step 6 below). Everything else routes through dispatch-bot.
+
+### 3. Create the `#Dispatch` stream **[Pete]**
+
+In Zulip: **Create channel** → name `Dispatch`. Subscribers: yourself + dispatch-bot. Phase-1 bots (like briefing-bot) don't need to be subscribed.
+
+### 4. Subscribe dispatch-bot to existing bot streams **[Pete]**
+
+For every bot home stream that exists from phase 1 (e.g. `#briefing`), add dispatch-bot as a subscriber so the dispatcher can see wake-up triggers. After phase 2.4's `create-bot` command lands this is automated, but phase-1 bots need a one-time manual subscribe.
+
+### 5. Wire credentials into `.env` **[Pete]**
+
+Add to `~/zulip-claude-channel/.env` (alongside the existing briefing-bot block):
+
+```
+# Dispatch bot — fleet-ops identity, must be a Zulip organization admin
+DISPATCH_BOT_EMAIL=dispatch-bot@<your-realm>.zulipchat.com
+DISPATCH_BOT_API_KEY=<paste from Zulip>
+DISPATCH_STREAM=Dispatch
+```
+
+Stream names are case-sensitive in Zulip's API — match the casing exactly.
+
+### 6. Wire owner credentials for bot creation **[Pete]**
+
+Zulip's `/bots` endpoint refuses bot callers, even admins. To make `create-bot` and the rest of the bot lifecycle fully automatic, the dispatcher needs your personal user creds for that one call.
+
+In Zulip: **Personal Settings → Account & Privacy** → look for **API key**. Copy your email and key.
+
+Add to `.env`:
+
+```
+# Owner identity — used only for /bots (creating new bot users)
+OWNER_EMAIL=<your personal Zulip email>
+OWNER_API_KEY=<your personal API key>
+```
+
+Same trust posture as dispatch-bot's key — keep it local, gitignored. If `OWNER_API_KEY` is omitted, `create-bot` fails with a clear message but other commands still work.
+
+### 7. Verify **[Pete]**
+
+```
+cd ~/zulip-claude-channel && bun run dispatcher
+```
+
+Should log `auth ok: dispatch-bot@...` and `event queue registered: ...`. From Zulip's `#Dispatch`, post `help` — dispatcher replies with the command list.
+
+## What's next
+
+Phase 2 is built in four end-to-end testable slices (see SPEC.md for details):
+- **2.1 ✓** — dispatcher daemon that wakes one hardcoded bot via JIT spawn.
+- **2.2 ✓** — `@dispatch` lifecycle commands (`spin up`, `shut down`, `list active`, `status`, `logs`, `help`).
+- **2.3a ✓** — `--resume` for cross-sleep continuity; `reset` command.
+- **2.3b** — `compact` command + `/handoff` invocation flow (deferred — brittle).
+- **2.4 (in progress)** — multi-bot fleet, `create-bot` / `retire` provisioning, persistent registry.
+
+**Phase 3** — inter-bot summoning via @-mentions, fleet roster, loop hazard handling. See SPEC.md.
