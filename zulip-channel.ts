@@ -1,7 +1,9 @@
 #!/usr/bin/env bun
 /**
- * Zulip ↔ Claude Code Channel — phase 1 implementation.
- * See SPEC.md for the design; RUNBOOK.md for how to run it.
+ * Channel server — bridges a Zulip stream to one Claude Code session via MCP.
+ * Spawned by Claude as a subprocess when launched with
+ * --dangerously-load-development-channels server:zulip-channel and a matching
+ * --mcp-config (see shared-mcp.json). See SPEC.md for the broader design.
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
@@ -12,6 +14,7 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import { appendFileSync, existsSync, readFileSync, unlinkSync } from 'node:fs';
+import { makeZulipClient } from './lib/zulip.ts';
 
 // ---------- Debug log ----------
 // stderr from MCP servers goes somewhere we can't easily find;
@@ -51,42 +54,8 @@ const DANGER_PATTERNS: RegExp[] = [
   /\bmkfs\b/i,
 ];
 
-// ---------- Zulip API helper ----------
-const ZAUTH = 'Basic ' + Buffer.from(`${BOT_EMAIL}:${API_KEY}`).toString('base64');
-
-async function zulip(
-  path: string,
-  opts: { method?: string; params?: Record<string, unknown> } = {},
-): Promise<any> {
-  const method = opts.method ?? 'GET';
-  const url = new URL(`/api/v1${path}`, SITE);
-  const init: RequestInit = { method, headers: { Authorization: ZAUTH } };
-
-  if (opts.params) {
-    if (method === 'GET') {
-      for (const [k, v] of Object.entries(opts.params)) {
-        url.searchParams.set(k, typeof v === 'string' ? v : JSON.stringify(v));
-      }
-    } else {
-      const body = new URLSearchParams();
-      for (const [k, v] of Object.entries(opts.params)) {
-        body.set(k, typeof v === 'string' ? v : JSON.stringify(v));
-      }
-      init.body = body;
-      init.headers = {
-        ...init.headers,
-        'Content-Type': 'application/x-www-form-urlencoded',
-      };
-    }
-  }
-
-  const res = await fetch(url, init);
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok || (data as any).result !== 'success') {
-    throw new Error(`Zulip ${method} ${path} failed (HTTP ${res.status}): ${JSON.stringify(data)}`);
-  }
-  return data;
-}
+// ---------- Zulip API client ----------
+const zulip = makeZulipClient({ site: SITE, email: BOT_EMAIL, apiKey: API_KEY });
 
 // ---------- Startup credential validation ----------
 let me: any;

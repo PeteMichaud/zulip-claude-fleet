@@ -1,16 +1,23 @@
 #!/usr/bin/env bun
 /**
- * Phase 2.1 dispatcher — wake-up only.
+ * Dispatcher — fleet supervisor and Zulip command handler.
  *
- * For now this is a SKELETON: it subscribes to Zulip for the registered
- * bot's home stream and logs inbound messages from the owner. Spawning
- * Claude on those inbounds (the actual wake-up) lands in step 4.
+ * Operates under @dispatch-bot's identity. Single Zulip event queue gets
+ * messages from every stream dispatch-bot is subscribed to (#Dispatch and
+ * each registered bot's home stream); handleMessage routes by stream:
+ *   - #Dispatch: parse fleet-ops commands (spin up, shut down, list, etc.)
+ *   - bot home stream: wake-up trigger if the bot is sleeping
  *
- * See PHASE-2.1.md for the broader design.
+ * Spawned bots are children of this process, supervised via Bun.Subprocess.
+ * Per-bot creds in REGISTRY are injected into each spawn's env so the
+ * channel server authenticates as that bot, not as dispatch-bot.
+ *
+ * See SPEC.md for the broader design and PHASE-2.1.md for the build notes.
  */
 
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { makeZulipClient } from './lib/zulip.ts';
 
 type Subprocess = ReturnType<typeof Bun.spawn>;
 type WakeTrigger = { stream: string; topic: string; sender: string; content: string };
@@ -64,40 +71,13 @@ function log(...parts: unknown[]) {
   console.log(line);
 }
 
-// ---------- Zulip API helper ----------
+// ---------- Zulip API client ----------
 
-const ZAUTH = 'Basic ' + Buffer.from(`${DISPATCH_BOT_EMAIL}:${DISPATCH_BOT_API_KEY}`).toString('base64');
-
-async function zulip(
-  path: string,
-  opts: { method?: string; params?: Record<string, unknown>; signal?: AbortSignal } = {},
-): Promise<any> {
-  const method = opts.method ?? 'GET';
-  const url = new URL(`/api/v1${path}`, SITE);
-  const init: RequestInit = { method, headers: { Authorization: ZAUTH }, signal: opts.signal };
-
-  if (opts.params) {
-    if (method === 'GET') {
-      for (const [k, v] of Object.entries(opts.params)) {
-        url.searchParams.set(k, typeof v === 'string' ? v : JSON.stringify(v));
-      }
-    } else {
-      const body = new URLSearchParams();
-      for (const [k, v] of Object.entries(opts.params)) {
-        body.set(k, typeof v === 'string' ? v : JSON.stringify(v));
-      }
-      init.body = body;
-      init.headers = { ...init.headers, 'Content-Type': 'application/x-www-form-urlencoded' };
-    }
-  }
-
-  const res = await fetch(url, init);
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok || (data as any).result !== 'success') {
-    throw new Error(`Zulip ${method} ${path} failed (HTTP ${res.status}): ${JSON.stringify(data)}`);
-  }
-  return data;
-}
+const zulip = makeZulipClient({
+  site: SITE,
+  email: DISPATCH_BOT_EMAIL,
+  apiKey: DISPATCH_BOT_API_KEY,
+});
 
 // ---------- Per-bot state ----------
 
@@ -290,7 +270,7 @@ async function maybeSpawn(bot: Bot, trigger: WakeTrigger): Promise<void> {
     await spawnBot(bot, trigger);
   } catch (err: any) {
     log(`@${bot.name} spawn failed: ${err.message}`);
-    // TODO 2.2: post into @dispatch ops stream and mark broken in state.
+    // TODO: post failure into #Dispatch and set state.broken to the message.
   } finally {
     releaseLock();
   }
