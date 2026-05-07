@@ -3,7 +3,7 @@
  * Channel server — bridges a Zulip stream to one Claude Code session via MCP.
  * Spawned by Claude as a subprocess when launched with
  * --dangerously-load-development-channels server:zulip-channel and a matching
- * --mcp-config (see shared-mcp.json). See SPEC.md for the broader design.
+ * --mcp-config (see shared-mcp.json). See README.md for the project overview.
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';

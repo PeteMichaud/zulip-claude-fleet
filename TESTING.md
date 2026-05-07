@@ -45,4 +45,4 @@ Specifically un-tested:
 - **Adding a new command** → add a case to `parseCommand` and a test in `commands.test.ts`. The handler can stay un-unit-tested for now.
 - **Adding a danger pattern** → add to `DANGER_PATTERNS` and a positive test in `permission.test.ts`.
 - **Changing the Zulip helper** → corresponding test in `zulip.test.ts`. The mock-fetch pattern there is straightforward to extend.
-- **Anything else in dispatcher.ts / zulip-channel.ts** → no test until we add the mock-Zulip layer. Manual verification per `RUNBOOK.md` for now.
+- **Anything else in dispatcher.ts / zulip-channel.ts** → no test until we add the mock-Zulip layer. Manual verification by running through the README quickstart for now.

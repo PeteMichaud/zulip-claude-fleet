@@ -12,7 +12,7 @@
  * Per-bot creds in REGISTRY are injected into each spawn's env so the
  * channel server authenticates as that bot, not as dispatch-bot.
  *
- * See SPEC.md for the broader design and PHASE-2.1.md for the build notes.
+ * See README.md for the project overview.
  */
 
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
