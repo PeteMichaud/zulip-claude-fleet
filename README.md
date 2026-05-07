@@ -1,4 +1,4 @@
-# zulip-claude-channel
+# zulip-claude-fleet
 
 Talk to a fleet of Claude Code agents through Zulip streams — one bot per stream — instead of cycling terminal tabs.
 
@@ -9,21 +9,21 @@ Each bot is a long-running Claude session living in its own Zulip stream. A disp
 In `#Dispatch`:
 
 ```
-Pete:        create-bot writer
+you:         create-bot writer
 @dispatch:   ✓ @writer created
-             - bot user: writer-bot-bot@petefleet.zulipchat.com
+             - bot user: writer-bot-bot@your-realm.zulipchat.com
              - home stream: #writer
-             - working tree: /Users/pete/claude-fleet/writer
+             - working tree: ~/claude-fleet/writer
 ```
 
 In `#writer`:
 
 ```
-Pete:        you're a technical writer focused on tight prose. Edit your
+you:         you're a technical writer focused on tight prose. Edit your
              CLAUDE.md to reflect that, then ask dispatch to reset you.
 @writer:     [writes CLAUDE.md] [posts "reset writer" in #Dispatch]
 @dispatch:   @writer reset; next start is fresh
-Pete:        ok, here's a draft I want feedback on…
+you:         ok, here's a draft I want feedback on…
 @writer:     [edit notes]
 ```
 
@@ -35,14 +35,14 @@ Requires macOS (Linux probably works; Windows doesn't — see roadmap), [Bun](ht
 
 1. Create or join a Zulip realm — Zulip Cloud's free tier works.
 2. Personal Settings → Bots → create a generic bot named `dispatch-bot`. Save its email and API key.
-3. Manage organization → Users → set `dispatch-bot`'s role to **Organization administrator**. (Required for stream creation, user deactivation, and stream archival; see the runbook for the why.)
+3. Manage organization → Users → set `dispatch-bot`'s role to **Organization administrator**. Required for stream creation with multi-user subscriptions, user deactivation, and stream archival. *Note: even with admin, bot users can't create other bots — Zulip's `/bots` endpoint refuses bot callers regardless of role. The dispatcher uses your personal user creds for that one specific call (see `OWNER_*` in `.env.example`).*
 4. Create the `#Dispatch` stream. Subscribe yourself + dispatch-bot.
 
 **Local side**:
 
 ```
-git clone https://github.com/PeteMichaud/zulip-claude-channel.git
-cd zulip-claude-channel
+git clone https://github.com/PeteMichaud/zulip-claude-fleet.git
+cd zulip-claude-fleet
 bun install
 cp shared-mcp.json.example shared-mcp.json   # edit the absolute path inside
 cp .env.example .env                          # fill in credentials
@@ -67,13 +67,13 @@ Test coverage and known gaps: [TESTING.md](TESTING.md).
 
 ## Status
 
-Phase 2.4 done. End-to-end working: JIT spawn, lifecycle commands, persistent conversation continuity via `claude --resume`, fully automated `create-bot` / `retire`, permission relay with emoji reactions and danger-pattern carve-outs.
+End-to-end working: JIT spawn (bot wakes when you message it), lifecycle commands (`spin up` / `shut down` / `reset` / `status` / `logs` / `list active`), persistent conversation continuity via `claude --resume` so context survives sleep/wake, fully automated `create-bot` / `retire`, permission relay with emoji reactions and a danger-pattern carve-out for things like `rm -rf`.
 
-48 unit tests for pure helpers (command parsing, formatting, permission logic, Zulip client). Integration paths (process supervision, MCP wiring, real Zulip behavior) are manually verified per the runbook — see TESTING.md for what's covered vs. deferred.
+48 unit tests cover the pure helpers (command parsing, formatting, permission logic, Zulip client). Integration paths (process supervision, MCP wiring, real Zulip behavior) are manually verified by running through the quickstart above — see TESTING.md for what's covered vs. deferred.
 
 ## Roadmap
 
-- **Cross-platform.** macOS verified. Linux probably fine (POSIX paths + Python's `pty` is Unix-only but works there). Windows currently broken: `scripts/pty-helper.py` relies on Unix PTY APIs. Either fix `node-pty`'s `posix_spawnp` failure (we hit it on macOS during phase 2.1, didn't fully diagnose) or write a Windows-specific spawn path.
+- **Cross-platform.** macOS verified. Linux probably fine (POSIX paths + Python's `pty` is Unix-only but works there). Windows currently broken: `scripts/pty-helper.py` relies on Unix PTY APIs. Either fix `node-pty`'s `posix_spawnp` failure (we hit it on macOS during the build but didn't fully diagnose) or write a Windows-specific spawn path.
 - **Smarter dispatcher.** The dispatcher's command grammar is hand-coded regex. A meta-Claude *inside* `@dispatch-bot` could interpret natural-language requests ("spin up a Python expert that handles refactoring questions, name it pyrefactor") and translate them into structured calls. Removes the need to extend the parser for every new operation.
 - **Handoff on shutdown.** `shut down` and `compact` don't auto-invoke the `/handoff` skill to capture tacit state — `--resume` carries conversation history but not the latent stuff (working hypotheses, ruled-out approaches, "what was I about to do"). Brittle to implement (the dispatcher has to instruct Claude to write the file, then wait for completion or timeout, then kill); deferred for now.
 - **Inter-bot conversation.** Each bot's channel server would also listen for messages mentioning it across other streams, so `@editor` could be summoned into `#writer` mid-conversation. Needs a fleet roster (so bots discover each other) and loop-hazard mitigation (rate limit / mention-depth cap to prevent two bots ping-ponging forever).
