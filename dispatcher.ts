@@ -15,7 +15,7 @@
  * See SPEC.md for the broader design and PHASE-2.1.md for the build notes.
  */
 
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { makeZulipClient } from './lib/zulip.ts';
 import { parseCommand } from './lib/commands.ts';
@@ -80,6 +80,35 @@ const zulip = makeZulipClient({
   email: DISPATCH_BOT_EMAIL,
   apiKey: DISPATCH_BOT_API_KEY,
 });
+
+// ---------- Session-storage discovery ----------
+
+// Claude Code stores session jsonls at:
+//   $CLAUDE_CONFIG_DIR/projects/<encoded-cwd>/<session-id>.jsonl
+// where the encoding is just every '/' in the absolute path replaced with '-'.
+// Capturing the latest session_id after a bot exits lets us pass it to
+// `claude --resume <id>` on the next spawn, preserving the bot's working
+// memory across sleep/wake cycles.
+
+function encodeCwd(absPath: string): string {
+  return absPath.replaceAll('/', '-');
+}
+
+function latestSessionId(claudeConfigDir: string, botCwd: string): string | null {
+  const dir = join(claudeConfigDir, 'projects', encodeCwd(botCwd));
+  if (!existsSync(dir)) return null;
+  let latest: { name: string; mtime: number } | null = null;
+  for (const f of readdirSync(dir)) {
+    if (!f.endsWith('.jsonl')) continue;
+    try {
+      const m = statSync(join(dir, f)).mtimeMs;
+      if (latest === null || m > latest.mtime) latest = { name: f, mtime: m };
+    } catch {
+      /* skip unreadable entries */
+    }
+  }
+  return latest ? latest.name.replace(/\.jsonl$/, '') : null;
+}
 
 // ---------- Per-bot state ----------
 
@@ -183,13 +212,23 @@ async function spawnBot(bot: Bot, trigger: WakeTrigger): Promise<void> {
   logWriter.write(`\n--- spawn at ${new Date().toISOString()} ---\n`);
   try { await logWriter.flush(); } catch { /* non-fatal */ }
 
+  // Resume the bot's prior session if we know about one; otherwise start fresh.
+  // session_id was captured at the previous exit (see child.exited handler below).
+  const priorState = readState(bot.name);
+  const cmd: string[] = ['python3', PTY_HELPER, 'claude'];
+  if (priorState.session_id) {
+    cmd.push('--resume', priorState.session_id);
+    log(`@${bot.name}: resuming session ${priorState.session_id}`);
+  } else {
+    log(`@${bot.name}: no prior session_id — starting fresh`);
+  }
+  cmd.push(
+    '--dangerously-load-development-channels', 'server:zulip-channel',
+    '--mcp-config', SHARED_MCP_CONFIG,
+  );
+
   const child = Bun.spawn({
-    cmd: [
-      'python3', PTY_HELPER,
-      'claude',
-      '--dangerously-load-development-channels', 'server:zulip-channel',
-      '--mcp-config', SHARED_MCP_CONFIG,
-    ],
+    cmd,
     cwd: bot.cwd,
     env: {
       ...process.env,
@@ -233,6 +272,18 @@ async function spawnBot(bot: Bot, trigger: WakeTrigger): Promise<void> {
     runningBots.delete(bot.name);
     startTimes.delete(bot.name);
     log(`@${bot.name} exited (code ${exitCode})`);
+
+    // Capture the session_id of the just-ended session so the next wake can
+    // --resume it. Picks the newest jsonl in the bot's CLAUDE_CONFIG_DIR
+    // project directory.
+    const sid = latestSessionId(CLAUDE_CONFIG_DIR_DEFAULT, bot.cwd);
+    if (sid) {
+      const state = readState(bot.name);
+      state.session_id = sid;
+      writeState(state);
+      log(`@${bot.name}: stored session_id=${sid} for next resume`);
+    }
+
     try {
       await logWriter.flush();
       logWriter.end();
@@ -347,6 +398,7 @@ async function handleDispatchCommand(msg: any): Promise<void> {
   switch (cmd.kind) {
     case 'spinUp':     return cmdSpinUp(topic, cmd.target);
     case 'shutDown':   return cmdShutDown(topic, cmd.target);
+    case 'reset':      return cmdReset(topic, cmd.target);
     case 'listActive': return cmdListActive(topic);
     case 'status':     return cmdStatus(topic, cmd.target);
     case 'logs':       return cmdLogs(topic, cmd.target, cmd.n);
@@ -382,6 +434,38 @@ async function cmdShutDown(topic: string, name: string): Promise<void> {
   } catch (err: any) {
     await postToDispatch(topic, `failed to kill @${bot.name}: ${err.message}`);
   }
+}
+
+// Kill (if running), wait for exit, then clear the stored session_id so the
+// next spawn starts fresh instead of resuming. The `/clear` equivalent for
+// the bot-as-a-fleet member.
+async function cmdReset(topic: string, name: string): Promise<void> {
+  const bot = REGISTRY[name];
+  if (!bot) return postToDispatch(topic, `no bot named \`${name}\` in registry`);
+
+  const child = runningBots.get(bot.name);
+  if (child) {
+    try {
+      child.kill('SIGTERM');
+    } catch (err: any) {
+      log(`@${bot.name} reset: kill failed: ${err.message}`);
+    }
+    // Wait for the exit handler to run (it captures session_id, which we
+    // immediately overwrite below). Bounded so a stuck child doesn't hang us.
+    await Promise.race([
+      child.exited,
+      new Promise((r) => setTimeout(r, 5000)),
+    ]);
+  }
+
+  const state = readState(bot.name);
+  state.session_id = null;
+  writeState(state);
+
+  await postToDispatch(
+    topic,
+    `@${bot.name} reset — session cleared; the next start will be a fresh conversation`,
+  );
 }
 
 async function cmdListActive(topic: string): Promise<void> {
@@ -439,8 +523,9 @@ async function cmdHelp(topic: string): Promise<void> {
     topic,
     [
       '**Fleet-ops commands** (post in #' + DISPATCH_STREAM + '):',
-      '- `spin up @<bot>` — start that bot',
-      '- `shut down @<bot>` — kill that bot',
+      '- `spin up @<bot>` — start that bot (resumes prior session if known)',
+      '- `shut down @<bot>` — kill that bot (next start will resume)',
+      '- `reset @<bot>` — kill and clear stored session; next start is fresh',
       '- `list active` — running bots + uptime',
       '- `status [@<bot>]` — alive/sleeping + last activity (all bots if no name)',
       '- `logs @<bot> [n]` — last n lines of bot stdout/stderr (default 30)',

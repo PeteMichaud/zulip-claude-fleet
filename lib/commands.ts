@@ -4,6 +4,7 @@
 export type Command =
   | { kind: 'spinUp'; target: string }
   | { kind: 'shutDown'; target: string }
+  | { kind: 'reset'; target: string }
   | { kind: 'listActive' }
   | { kind: 'status'; target: string | undefined }
   | { kind: 'logs'; target: string; n: number }
@@ -21,6 +22,9 @@ export function parseCommand(text: string): Command {
   }
   if ((m = t.match(/^(?:shut\s+down|stop|kill)\s+@?(\w+)\s*$/i))) {
     return { kind: 'shutDown', target: m[1] };
+  }
+  if ((m = t.match(/^reset\s+@?(\w+)\s*$/i))) {
+    return { kind: 'reset', target: m[1] };
   }
   if (/^list(\s+active)?\s*$/i.test(t)) {
     return { kind: 'listActive' };

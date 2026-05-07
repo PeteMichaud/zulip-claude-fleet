@@ -9,6 +9,12 @@ describe('parseCommand', () => {
     expect(parseCommand('start briefing')).toEqual({ kind: 'spinUp', target: 'briefing' });
   });
 
+  test('reset', () => {
+    expect(parseCommand('reset briefing')).toEqual({ kind: 'reset', target: 'briefing' });
+    expect(parseCommand('reset @briefing')).toEqual({ kind: 'reset', target: 'briefing' });
+    expect(parseCommand('Reset briefing')).toEqual({ kind: 'reset', target: 'briefing' });
+  });
+
   test('shut down (multiple synonyms)', () => {
     expect(parseCommand('shut down briefing')).toEqual({ kind: 'shutDown', target: 'briefing' });
     expect(parseCommand('shut  down  briefing')).toEqual({ kind: 'shutDown', target: 'briefing' }); // multi-space tolerant
