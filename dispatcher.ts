@@ -205,6 +205,10 @@ try {
 }
 log(`auth ok: ${me.email} (user_id ${me.user_id}); registered bots: [${Object.keys(REGISTRY).join(', ')}]`);
 
+// dispatch-bot's user_id, passed to spawned channel servers so they accept
+// our forward posts (@-mention relay, see processMentions below).
+const DISPATCH_BOT_USER_ID: number = me.user_id;
+
 // ---------- Zulip event queue ----------
 
 let queueId: string | undefined;
@@ -288,6 +292,9 @@ async function spawnBot(bot: Bot, trigger: WakeTrigger): Promise<void> {
       ZULIP_BOT_EMAIL: bot.bot_email,
       ZULIP_API_KEY: bot.bot_api_key,
       ZULIP_HOME_STREAM: bot.home_stream,
+      // Telling the channel server who the dispatcher is so it'll accept
+      // our forward posts (otherwise its sender gate drops them).
+      DISPATCH_BOT_USER_ID: String(DISPATCH_BOT_USER_ID),
     },
     stdin: 'pipe',
     stdout: 'pipe',
@@ -386,51 +393,164 @@ function botForStream(stream: string): Bot | undefined {
 
 async function handleMessage(event: any) {
   const msg = event.message;
+  const senderEmail = String(msg.sender_email ?? '');
   const stream = typeof msg.display_recipient === 'string' ? msg.display_recipient : '';
 
+  // Always ignore our own posts (dispatch-bot's queue receives messages
+  // it itself sends, since it's subscribed to the streams it posts in).
+  if (senderEmail === DISPATCH_BOT_EMAIL) return;
+
   // #Dispatch: fleet-ops commands. Owner can do anything; bots can issue
-  // self-targeted commands (so a bot can ask to be reset after editing
-  // its own CLAUDE.md, etc.). Sender filtering happens inside.
+  // self-targeted commands. Sender filtering happens inside.
   if (stream === DISPATCH_STREAM) {
     await handleDispatchCommand(msg);
     return;
   }
 
-  // Bot home streams: wake-up logic, owner-only.
-  if (msg.sender_id !== OWNER_USER_ID) return;
-
-  const bot = botForStream(stream);
-  if (!bot) {
+  const homeBot = botForStream(stream);
+  if (!homeBot) {
     log(`inbound in unregistered stream "${stream}", ignoring`);
     return;
   }
 
-  const snippet = (msg.content ?? '').slice(0, 100).replace(/\n/g, ' ');
-  log(`inbound for @${bot.name}: topic="${msg.subject ?? ''}" sender="${msg.sender_full_name ?? ''}" content=${JSON.stringify(snippet)}`);
+  const isOwner = msg.sender_id === OWNER_USER_ID;
+  const issuingBot = isOwner ? undefined : botFromSender(senderEmail);
+  if (!isOwner && !issuingBot) return; // unknown sender — ignore
 
-  const state = readState(bot.name);
-  state.last_active = new Date().toISOString();
-  writeState(state);
+  // Wake-up logic: only the operator's messages summon a sleeping bot. A
+  // registered bot posting in its own stream is already alive (or will be
+  // mediated by @-mention forwarding below if it's mentioning someone else).
+  if (isOwner) {
+    const snippet = (msg.content ?? '').slice(0, 100).replace(/\n/g, ' ');
+    log(`inbound for @${homeBot.name}: topic="${msg.subject ?? ''}" sender="${msg.sender_full_name ?? ''}" content=${JSON.stringify(snippet)}`);
 
-  if (isAlive(bot.name)) {
-    // Bot's own channel MCP will receive this same event from its own queue.
-    // Dispatcher does nothing.
-    return;
+    const state = readState(homeBot.name);
+    state.last_active = new Date().toISOString();
+    writeState(state);
+
+    if (!isAlive(homeBot.name)) {
+      const trigger: WakeTrigger = {
+        stream,
+        topic: msg.subject || 'chat',
+        sender: msg.sender_full_name ?? '',
+        content: msg.content ?? '',
+      };
+      await maybeSpawn(homeBot, trigger);
+    }
+    // (If alive, the bot's own MCP queue picks up the message; dispatcher
+    // does nothing further for the wake-up path.)
   }
 
-  const trigger: WakeTrigger = {
-    stream,
-    topic: msg.subject || 'chat',
-    sender: msg.sender_full_name ?? '',
-    content: msg.content ?? '',
-  };
-  await maybeSpawn(bot, trigger);
+  // @-mention relay: scan for mentions of OTHER registered bots and forward
+  // each one to its target. Owner-issued mentions and bot-issued mentions
+  // both flow through here.
+  await processMentions(msg, stream, homeBot);
 }
 
 // Find a bot in the registry whose Zulip identity sent this message.
-// Used to allow bots to issue self-targeted commands in #Dispatch.
+// Used to allow bots to issue self-targeted commands in #Dispatch and to
+// propagate @-mentions originating from one bot to another.
 function botFromSender(senderEmail: string): Bot | undefined {
   return Object.values(REGISTRY).find((b) => b.bot_email === senderEmail);
+}
+
+// ---------- @-mention relay ----------
+
+// Recent forward timestamps per target bot. When a target has been forwarded
+// to >FORWARD_RATE_LIMIT times in the last FORWARD_RATE_WINDOW_MS, drop the
+// next forward. Crude loop guard — a bot-X-mentions-bot-Y-mentions-bot-X
+// cycle terminates within seconds at depth ~10.
+const forwardCounts = new Map<string, number[]>();
+const FORWARD_RATE_LIMIT = 10;
+const FORWARD_RATE_WINDOW_MS = 60_000;
+
+function shouldForwardTo(botName: string): boolean {
+  const now = Date.now();
+  const recent = (forwardCounts.get(botName) ?? []).filter(
+    (t) => now - t < FORWARD_RATE_WINDOW_MS,
+  );
+  if (recent.length >= FORWARD_RATE_LIMIT) return false;
+  recent.push(now);
+  forwardCounts.set(botName, recent);
+  return true;
+}
+
+// Match Zulip-formal @**Display Name** (we set Display Name = <name>-bot)
+// and informal @<name> or @<name>-bot. Returns deduped bots in mention order.
+function findMentionedBots(content: string): Bot[] {
+  const seen = new Set<string>();
+  const out: Bot[] = [];
+  const collect = (raw: string) => {
+    const candidate = raw.toLowerCase().replace(/-bot$/, '').trim();
+    const bot = REGISTRY[candidate];
+    if (bot && !seen.has(bot.name)) {
+      seen.add(bot.name);
+      out.push(bot);
+    }
+  };
+  for (const m of content.matchAll(/@\*\*([^*]+)\*\*/g)) collect(m[1]);
+  for (const m of content.matchAll(/@([a-z][\w-]*)/gi)) collect(m[1]);
+  return out;
+}
+
+// Returns the number of forwards actually issued (post-rate-limit, post-self-filter).
+async function processMentions(
+  msg: any,
+  originStream: string,
+  homeBot: Bot | undefined,
+): Promise<number> {
+  const content = String(msg.content ?? '');
+  const targets = findMentionedBots(content).filter(
+    (t) => !homeBot || t.name !== homeBot.name,
+  );
+  let count = 0;
+  for (const target of targets) {
+    if (!shouldForwardTo(target.name)) {
+      log(`forward suppressed (rate limit hit): @${target.name}`);
+      continue;
+    }
+    await forwardMention(target, msg, originStream).catch((err: any) =>
+      log(`forward to @${target.name} failed: ${err.message}`),
+    );
+    count++;
+  }
+  return count;
+}
+
+async function forwardMention(target: Bot, originalMsg: any, originStream: string): Promise<void> {
+  const sender = String(originalMsg.sender_full_name ?? '');
+  const originTopic = String(originalMsg.subject ?? 'chat');
+  const text = String(originalMsg.content ?? '');
+
+  const forwarded = [
+    `*(forwarded from #${originStream}, topic "${originTopic}", mentioned by ${sender})*`,
+    '',
+    text,
+    '',
+    `If you reply, post to #${originStream} via \`send(stream="${originStream}", topic="${originTopic}", text=...)\`.`,
+  ].join('\n');
+
+  if (isAlive(target.name)) {
+    log(`forwarding mention to @${target.name} (alive) via #${target.home_stream}`);
+    await zulip('/messages', {
+      method: 'POST',
+      params: {
+        type: 'stream',
+        to: target.home_stream,
+        topic: 'mentions',
+        content: forwarded,
+      },
+    });
+  } else {
+    log(`forwarding mention to @${target.name} (sleeping) — will spawn`);
+    const trigger: WakeTrigger = {
+      stream: target.home_stream,
+      topic: 'mentions',
+      sender: 'dispatch (forwarded mention)',
+      content: forwarded,
+    };
+    await maybeSpawn(target, trigger);
+  }
 }
 
 // ---------- Fleet-ops commands ----------
@@ -451,9 +571,7 @@ async function handleDispatchCommand(msg: any): Promise<void> {
   const topic = msg.subject || 'general';
   const senderEmail = String(msg.sender_email ?? '');
 
-  // Filter our own posts silently — dispatch-bot's queue receives the messages
-  // it itself sends (since it's subscribed to #Dispatch).
-  if (senderEmail === DISPATCH_BOT_EMAIL) return;
+  // (handleMessage already filters dispatch-bot's own posts before we get here.)
 
   // Identify the sender. Owner gets full command access; a registered bot
   // gets a self-restricted subset (so it can request its own reset/shutdown
@@ -490,8 +608,15 @@ async function handleDispatchCommand(msg: any): Promise<void> {
     case 'status':     return cmdStatus(topic, cmd.target);
     case 'logs':       return cmdLogs(topic, cmd.target, cmd.n);
     case 'help':       return cmdHelp(topic);
-    case 'unknown':
-      await postToDispatch(topic, `unrecognized: \`${cmd.text}\`. try \`help\`.`);
+    case 'unknown': {
+      // Not a command — maybe it's chat that mentions a bot. #Dispatch
+      // doubles as a general "talk to any bot" surface so the operator
+      // doesn't have to switch streams.
+      const forwarded = await processMentions(msg, DISPATCH_STREAM, undefined);
+      if (forwarded === 0) {
+        await postToDispatch(topic, `unrecognized: \`${cmd.text}\`. try \`help\`.`);
+      }
+    }
   }
 }
 
@@ -771,10 +896,12 @@ async function cmdRetire(topic: string, name: string): Promise<void> {
   }
 
   // Step 3: deactivate the bot user. Reversible; preserves history.
+  // Zulip's DELETE /users/<id> only handles human users — bots use the
+  // /bots/<id> endpoint instead. dispatch-bot's admin role is sufficient.
   if (userId !== null) {
     try {
-      await zulip(`/users/${userId}`, { method: 'DELETE' });
-      log(`@${bot.name} retire: deactivated user_id ${userId}`);
+      await zulip(`/bots/${userId}`, { method: 'DELETE' });
+      log(`@${bot.name} retire: deactivated bot user_id ${userId}`);
     } catch (err: any) {
       log(`@${bot.name} retire: deactivation failed: ${err.message}`);
     }

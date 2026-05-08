@@ -15,11 +15,22 @@ export type Command =
 
 const DEFAULT_LOG_LINES = 30;
 
+// Convert Zulip-formal @**Display Name** mentions to informal @name so
+// the command regexes (which expect [\w-]+ targets) can match. Also drops
+// the `-bot` suffix Zulip's autocomplete inserts (full_name is `<name>-bot`
+// but the registry is keyed by `<name>`).
+function normalizeMentions(text: string): string {
+  return text.replace(
+    /@\*\*([^*]+)\*\*/g,
+    (_, raw) => '@' + String(raw).trim().toLowerCase().replace(/-bot$/, ''),
+  );
+}
+
 export function parseCommand(text: string): Command {
-  const t = text.trim();
+  const t = normalizeMentions(text.trim());
 
   let m;
-  if ((m = t.match(/^(?:spin[\s-]+up|start)\s+@?([\w-]+)\s*$/i))) {
+  if ((m = t.match(/^(?:spin[\s-]+up|wake[\s-]+up|wake|start)\s+@?([\w-]+)\s*$/i))) {
     return { kind: 'spinUp', target: m[1] };
   }
   if ((m = t.match(/^(?:shut[\s-]+down|stop|kill)\s+@?([\w-]+)\s*$/i))) {

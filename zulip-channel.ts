@@ -324,9 +324,21 @@ async function registerQueue() {
   debug('event queue registered:', queueId);
 }
 
+// Accept messages from the operator (always) and from the dispatcher's
+// own bot identity (when DISPATCH_BOT_USER_ID is set in env). The latter
+// lets the dispatcher relay inter-bot @-mention forwards to us.
+const ALLOWED_SENDER_IDS = new Set<number>([OWNER_USER_ID]);
+{
+  const raw = process.env.DISPATCH_BOT_USER_ID;
+  if (raw) {
+    const id = parseInt(raw, 10);
+    if (Number.isFinite(id)) ALLOWED_SENDER_IDS.add(id);
+  }
+}
+
 async function handleMessage(event: any) {
   const msg = event.message;
-  if (msg.sender_id !== OWNER_USER_ID) return; // sender gate
+  if (!ALLOWED_SENDER_IDS.has(msg.sender_id)) return; // sender gate
 
   const text: string = msg.content;
 

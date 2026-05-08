@@ -2,12 +2,19 @@ import { describe, expect, test } from 'bun:test';
 import { parseCommand } from './commands.ts';
 
 describe('parseCommand', () => {
-  test('spin up (space or hyphen between words)', () => {
+  test('spin up (synonyms, hyphen-or-space between words)', () => {
     expect(parseCommand('spin up briefing')).toEqual({ kind: 'spinUp', target: 'briefing' });
     expect(parseCommand('spin-up briefing')).toEqual({ kind: 'spinUp', target: 'briefing' });
     expect(parseCommand('spin up @briefing')).toEqual({ kind: 'spinUp', target: 'briefing' });
     expect(parseCommand('SPIN UP briefing')).toEqual({ kind: 'spinUp', target: 'briefing' });
     expect(parseCommand('start briefing')).toEqual({ kind: 'spinUp', target: 'briefing' });
+    expect(parseCommand('wake up briefing')).toEqual({ kind: 'spinUp', target: 'briefing' });
+    expect(parseCommand('wake-up briefing')).toEqual({ kind: 'spinUp', target: 'briefing' });
+    expect(parseCommand('wake briefing')).toEqual({ kind: 'spinUp', target: 'briefing' });
+    // Zulip's autocomplete inserts formal @**name-bot** mentions
+    expect(parseCommand('wake up @**briefing**')).toEqual({ kind: 'spinUp', target: 'briefing' });
+    expect(parseCommand('wake up @**briefing-bot**')).toEqual({ kind: 'spinUp', target: 'briefing' });
+    expect(parseCommand('spin up @**Briefing-Bot**')).toEqual({ kind: 'spinUp', target: 'briefing' });
   });
 
   test('reset', () => {
