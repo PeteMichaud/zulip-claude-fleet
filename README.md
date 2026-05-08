@@ -67,7 +67,7 @@ Test coverage and known gaps: [TESTING.md](TESTING.md).
 
 ## Status
 
-End-to-end working: JIT spawn (bot wakes when you message it), lifecycle commands (`spin up` / `shut down` / `reset` / `status` / `logs` / `list active`), persistent conversation continuity via `claude --resume` so context survives sleep/wake, fully automated `create-bot` / `retire`, permission relay with emoji reactions and a danger-pattern carve-out for things like `rm -rf`.
+End-to-end working: JIT spawn (bot wakes when you message it), lifecycle commands (`spin up` / `shut down` / `reset` / `status` / `logs` / `list active`), persistent conversation continuity via `claude --resume` so context survives sleep/wake, fully automated `create-bot` / `retire`, permission relay with emoji reactions and a danger-pattern carve-out for things like `rm -rf`, and inter-bot @-mention relay — `@editor` in `#writer` summons editor (waking it if asleep) and editor's reply lands back in `#writer` without subscribing every bot to every stream.
 
 48 unit tests cover the pure helpers (command parsing, formatting, permission logic, Zulip client). Integration paths (process supervision, MCP wiring, real Zulip behavior) are manually verified by running through the quickstart above — see TESTING.md for what's covered vs. deferred.
 
@@ -76,7 +76,7 @@ End-to-end working: JIT spawn (bot wakes when you message it), lifecycle command
 - **Cross-platform.** macOS verified. Linux probably fine (POSIX paths + Python's `pty` is Unix-only but works there). Windows currently broken: `scripts/pty-helper.py` relies on Unix PTY APIs. Either fix `node-pty`'s `posix_spawnp` failure (we hit it on macOS during the build but didn't fully diagnose) or write a Windows-specific spawn path.
 - **Smarter dispatcher.** The dispatcher's command grammar is hand-coded regex. A meta-Claude *inside* `@dispatch-bot` could interpret natural-language requests ("spin up a Python expert that handles refactoring questions, name it pyrefactor") and translate them into structured calls. Removes the need to extend the parser for every new operation.
 - **Handoff on shutdown.** `shut down` and `compact` don't auto-invoke the `/handoff` skill to capture tacit state — `--resume` carries conversation history but not the latent stuff (working hypotheses, ruled-out approaches, "what was I about to do"). Brittle to implement (the dispatcher has to instruct Claude to write the file, then wait for completion or timeout, then kill); deferred for now.
-- **Inter-bot conversation.** Each bot's channel server would also listen for messages mentioning it across other streams, so `@editor` could be summoned into `#writer` mid-conversation. Needs a fleet roster (so bots discover each other) and loop-hazard mitigation (rate limit / mention-depth cap to prevent two bots ping-ponging forever).
+- **Smarter inter-bot loop handling.** The basic @-mention relay ships with a crude rate limit (10 forwards/60s per target) — enough to bound runaway loops but heavy-handed. A real solution tracks mention-chain depth or per-conversation forward graphs.
 - **Idle shutdown.** Currently bots live until explicit `shut down` or dispatcher restart. A wall-clock-or-tool-activity threshold would auto-park sleeping bots to free token budget.
 - **Plugin packaging.** Get the channel server onto Anthropic's `--channels` allowlist so the dispatcher doesn't need `--dangerously-load-development-channels`.
 
