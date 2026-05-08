@@ -213,11 +213,15 @@ mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }) => {
   pendingPermissions.set(String(sentMsgId), params.request_id);
 
   if (!dangerous) {
-    // Pre-populate reactions for tap-to-approve. Non-fatal if it fails.
-    await Promise.all([
-      zulip(`/messages/${sentMsgId}/reactions`, { method: 'POST', params: { emoji_name: 'check' } }),
-      zulip(`/messages/${sentMsgId}/reactions`, { method: 'POST', params: { emoji_name: 'cross_mark' } }),
-    ]).catch((err) => debug('permission relay: pre-react failed (non-fatal):', err.message));
+    // Pre-populate reactions for tap-to-approve. Sequential so ✅ always
+    // appears before ❌ — concurrent POSTs race and invert muscle memory.
+    // Non-fatal if either fails.
+    try {
+      await zulip(`/messages/${sentMsgId}/reactions`, { method: 'POST', params: { emoji_name: 'check' } });
+      await zulip(`/messages/${sentMsgId}/reactions`, { method: 'POST', params: { emoji_name: 'cross_mark' } });
+    } catch (err: any) {
+      debug('permission relay: pre-react failed (non-fatal):', err.message);
+    }
   }
 });
 
