@@ -11,7 +11,7 @@ In `#Dispatch`:
 ```
 you:         create writer
 @dispatch:   ✓ @writer created
-             - bot user: writer-bot-bot@your-realm.zulipchat.com
+             - bot user: writer-bot@your-realm.zulipchat.com
              - home stream: #writer
              - working tree: ~/claude-fleet/writer
 ```
