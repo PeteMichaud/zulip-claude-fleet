@@ -20,6 +20,8 @@ import { join } from 'node:path';
 import { makeZulipClient } from './lib/zulip.ts';
 import { parseCommand } from './lib/commands.ts';
 import { humanDuration } from './lib/format.ts';
+import { isIdle, makeBotStateStore, type BotState } from './lib/state.ts';
+import { selfHealSubscriptions } from './lib/subs.ts';
 
 type Subprocess = ReturnType<typeof Bun.spawn>;
 type WakeTrigger = { stream: string; topic: string; sender: string; content: string; inbound_message_id?: number };
@@ -178,36 +180,9 @@ function latestSessionId(claudeConfigDir: string, botCwd: string): string | null
 
 // ---------- Per-bot state ----------
 
-type BotState = {
-  name: string;
-  last_active: string | null;
-  session_id: string | null;
-  broken: string | null; // failure reason if cred-rejected at spawn time
-};
-
-function statePath(botName: string) {
-  return join(STATE_DIR, `${botName}.json`);
-}
-
-function readState(botName: string): BotState {
-  const path = statePath(botName);
-  if (!existsSync(path)) {
-    return { name: botName, last_active: null, session_id: null, broken: null };
-  }
-  try {
-    return JSON.parse(readFileSync(path, 'utf-8'));
-  } catch (err: any) {
-    log(`state for ${botName} unreadable, treating as empty:`, err.message);
-    return { name: botName, last_active: null, session_id: null, broken: null };
-  }
-}
-
-function writeState(state: BotState) {
-  const path = statePath(state.name);
-  const tmp = `${path}.tmp`;
-  writeFileSync(tmp, JSON.stringify(state, null, 2) + '\n');
-  renameSync(tmp, path); // atomic-ish on POSIX same-fs
-}
+const stateStore = makeBotStateStore({ baseDir: STATE_DIR, log });
+const readState = stateStore.read;
+const writeState = stateStore.write;
 
 // ---------- Startup auth check ----------
 
@@ -226,26 +201,12 @@ log(`auth ok: ${me.email} (user_id ${me.user_id}); registered bots: [${Object.ke
 // our forward posts (@-mention relay, see processMentions below).
 const DISPATCH_BOT_USER_ID: number = me.user_id;
 
-// Self-heal subscriptions: the event queue only sees messages in streams
-// dispatch-bot is subscribed to. If it gets unsubscribed (manual toggle in
-// the Zulip UI, etc.) inbounds vanish silently. Re-subscribe at startup —
-// idempotent on Zulip's side, so this is a no-op when already in place.
-{
-  const homeStreams = Object.values(REGISTRY).map((b) => ({ name: b.home_stream }));
-  if (homeStreams.length > 0) {
-    try {
-      const result = await zulip('/users/me/subscriptions', {
-        method: 'POST',
-        params: { subscriptions: homeStreams },
-      });
-      const added: string[] = Object.keys(result.subscribed?.[me.email] ?? {});
-      if (added.length > 0) log(`subscribed dispatch-bot to: [${added.join(', ')}]`);
-      else log(`already subscribed to all ${homeStreams.length} bot home streams`);
-    } catch (err: any) {
-      log(`WARN: self-subscribe failed (${err.message}) — inbounds may not be received`);
-    }
-  }
-}
+await selfHealSubscriptions({
+  zulip,
+  myEmail: me.email,
+  streamNames: Object.values(REGISTRY).map((b) => b.home_stream),
+  log,
+});
 
 // ---------- Zulip event queue ----------
 
@@ -616,9 +577,7 @@ async function forwardMention(target: Bot, originalMsg: any, originStream: strin
 // ---------- Activity tracking + idle shutdown ----------
 
 function bumpActivity(botName: string): void {
-  const state = readState(botName);
-  state.last_active = new Date().toISOString();
-  writeState(state);
+  stateStore.bumpActivity(botName);
 }
 
 const IDLE_TIMEOUT_MS = parseInt(
@@ -631,15 +590,11 @@ async function checkIdleBots(): Promise<void> {
   const now = Date.now();
   for (const [name] of runningBots) {
     const state = readState(name);
-    if (!state.last_active) continue;
-    const lastMs = Date.parse(state.last_active);
-    if (Number.isNaN(lastMs)) continue;
-    const idleMs = now - lastMs;
-    if (idleMs >= IDLE_TIMEOUT_MS) {
-      await idleShutdown(name, idleMs).catch((err: any) =>
-        log(`idle shutdown of @${name} failed: ${err.message}`),
-      );
-    }
+    if (!isIdle({ lastActive: state.last_active, thresholdMs: IDLE_TIMEOUT_MS, now })) continue;
+    const idleMs = now - Date.parse(state.last_active!);
+    await idleShutdown(name, idleMs).catch((err: any) =>
+      log(`idle shutdown of @${name} failed: ${err.message}`),
+    );
   }
 }
 
