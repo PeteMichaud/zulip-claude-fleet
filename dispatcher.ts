@@ -734,22 +734,38 @@ async function handleDispatchCommand(msg: any): Promise<void> {
   const forwarded = await processMentions(msg, DISPATCH_STREAM, undefined);
   if (forwarded > 0) return;
 
-  const interp = await nlDispatch(text);
-  if (!interp) {
+  const plan = await nlDispatch(text);
+  if (plan === null) {
     await postToDispatch(topic, `unrecognized: \`${cmd.text}\`. try \`help\`.`);
     return;
   }
+  if (plan.length === 0) {
+    await postToDispatch(topic, `not sure what command \`${cmd.text}\` maps to. try \`help\`.`);
+    return;
+  }
 
-  if (isDestructive(interp)) {
+  // Destructive ops (retire/reset) require the operator to retype the explicit
+  // form — guessing at "kill the writer" with reset/retire is too easy to get
+  // wrong. If even one step in the plan is destructive, refuse the whole batch.
+  const dangerous = plan.filter((c) => isDestructive(c));
+  if (dangerous.length > 0) {
+    const rendered = dangerous.map((c) => `\`${renderCommand(c)}\``).join(', ');
     await postToDispatch(
       topic,
-      `i think you mean \`${renderCommand(interp)}\` — destructive, so type it explicitly to run.`,
+      `plan contains destructive ops (${rendered}) — type them explicitly to run.`,
     );
     return;
   }
 
-  await postToDispatch(topic, `interpreting as \`${renderCommand(interp)}\``);
-  return executeCommand(interp, topic);
+  if (plan.length === 1) {
+    await postToDispatch(topic, `interpreting as \`${renderCommand(plan[0])}\``);
+  } else {
+    const lines = plan.map((c, i) => `${i + 1}. \`${renderCommand(c)}\``);
+    await postToDispatch(topic, [`interpreting as ${plan.length} steps:`, ...lines].join('\n'));
+  }
+  for (const step of plan) {
+    await executeCommand(step, topic);
+  }
 }
 
 
