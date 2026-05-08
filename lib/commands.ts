@@ -6,8 +6,15 @@ export type Command =
   | { kind: 'spinUp'; target: string }
   | { kind: 'shutDown'; target: string }
   | { kind: 'reset'; target: string }
-  | { kind: 'create'; target: string; configDir?: string; noSpin?: boolean }
-  | { kind: 'update'; target: string; configDir?: string; clearConfig?: boolean }
+  | { kind: 'create'; target: string; configDir?: string; noSpin?: boolean; auto?: boolean; yolo?: boolean }
+  | {
+      kind: 'update';
+      target: string;
+      configDir?: string;
+      clearConfig?: boolean;
+      auto?: boolean;
+      yolo?: boolean;
+    }
   | { kind: 'retire'; target: string }
   | { kind: 'listActive' }
   | { kind: 'status'; target: string | undefined }
@@ -167,9 +174,13 @@ export function parseCommand(text: string): Command {
       const configFlag = flags.get('config');
       const configDir = typeof configFlag === 'string' ? configFlag : undefined;
       const noSpin = flags.get('no-spin') === true;
+      const auto = flags.get('auto') === true;
+      const yolo = flags.get('yolo') === true;
       const out: Command = { kind: 'create', target };
       if (configDir) out.configDir = configDir;
       if (noSpin) out.noSpin = true;
+      if (auto) out.auto = true;
+      if (yolo) out.yolo = true;
       return out;
     }
 
@@ -178,9 +189,21 @@ export function parseCommand(text: string): Command {
       const configFlag = flags.get('config');
       const clearConfig = flags.get('clear-config') === true;
       const configDir = typeof configFlag === 'string' ? configFlag : undefined;
+      // Tri-state for auto/yolo: --flag → true, --no-flag → false,
+      // omitted → undefined (leave the registry value unchanged).
+      const auto =
+        flags.get('auto') === true ? true :
+        flags.get('no-auto') === true ? false :
+        undefined;
+      const yolo =
+        flags.get('yolo') === true ? true :
+        flags.get('no-yolo') === true ? false :
+        undefined;
       const out: Command = { kind: 'update', target };
       if (configDir) out.configDir = configDir;
       if (clearConfig) out.clearConfig = true;
+      if (auto !== undefined) out.auto = auto;
+      if (yolo !== undefined) out.yolo = yolo;
       return out;
     }
 

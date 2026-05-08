@@ -27,6 +27,11 @@ import {
   setStreamPin,
 } from './lib/zulip-admin.ts';
 import { parseCommand } from './lib/commands.ts';
+import {
+  classifySender,
+  NL_EXEC_TOPIC,
+  routeDispatchMessage,
+} from './lib/dispatch-routing.ts';
 import { humanDuration } from './lib/format.ts';
 import { isIdle, makeBotStateStore, type BotState } from './lib/state.ts';
 import { makeSpawnOrchestrator } from './lib/spawn-orchestrator.ts';
@@ -59,6 +64,13 @@ type Bot = {
   // global default (CLAUDE_CONFIG_DIR env or ~/.claude). Lets a single fleet
   // mix bots running under different Claude config profiles.
   config_dir?: string;
+  // auto: channel server auto-approves every non-danger permission prompt
+  // (no Zulip prompt, no operator tap). Danger filter still applies.
+  auto?: boolean;
+  // yolo: passes `--dangerously-skip-permissions` to the spawned claude.
+  // Bypasses ALL permission checks including danger patterns. Use with care
+  // — recommended only for sandboxed bots.
+  yolo?: boolean;
 };
 
 // Bot working trees live under this directory. create-bot mkdirs
@@ -278,6 +290,13 @@ async function spawnBot(bot: Bot, trigger: WakeTrigger): Promise<void> {
     '--dangerously-load-development-channels', 'server:zulip-channel',
     '--mcp-config', SHARED_MCP_CONFIG,
   );
+  if (bot.yolo) {
+    // Bypass Claude Code's permission system entirely. The channel server's
+    // permission_request handler never fires under this flag, so neither
+    // `auto` nor the danger filter run — yolo really is yolo.
+    cmd.push('--dangerously-skip-permissions');
+    log(`@${bot.name}: spawning with --dangerously-skip-permissions (yolo mode)`);
+  }
 
   const botConfigDir = configDirFor(bot);
   // Pretrust the working tree under whichever config dir we're about to
@@ -305,6 +324,11 @@ async function spawnBot(bot: Bot, trigger: WakeTrigger): Promise<void> {
       // Telling the channel server who the dispatcher is so it'll accept
       // our forward posts (otherwise its sender gate drops them).
       DISPATCH_BOT_USER_ID: String(DISPATCH_BOT_USER_ID),
+      // auto mode: channel server short-circuits non-danger permission
+      // prompts to allow without bothering the operator. The danger filter
+      // still applies. yolo (above) is a stronger bypass at the claude-cli
+      // level and obviates the channel server's permission path entirely.
+      ...(bot.auto ? { ZULIP_AUTO_APPROVE: '1' } : {}),
     },
     stdin: 'pipe',
     stdout: 'pipe',
@@ -654,7 +678,12 @@ async function handleDispatchCommand(msg: any): Promise<void> {
     case 'spinUp':     return cmdSpinUp(topic, cmd.target);
     case 'shutDown':   return cmdShutDown(topic, cmd.target);
     case 'reset':      return cmdReset(topic, cmd.target);
-    case 'create':     return cmdCreate(topic, cmd.target, cmd.configDir, cmd.noSpin ?? false);
+    case 'create':     return cmdCreate(topic, cmd.target, {
+      configDir: cmd.configDir,
+      noSpin: cmd.noSpin ?? false,
+      auto: cmd.auto ?? false,
+      yolo: cmd.yolo ?? false,
+    });
     case 'update':     return cmdUpdate(topic, cmd.target, cmd);
     case 'retire':     return cmdRetire(topic, cmd.target);
     case 'listActive': return cmdListActive(topic);
@@ -742,7 +771,12 @@ async function cmdReset(topic: string, name: string): Promise<void> {
 // Provision a new bot end-to-end. Bot creation goes through the owner's
 // credentials because Zulip's /bots endpoint rejects bot callers; everything
 // else uses dispatch-bot.
-async function cmdCreate(topic: string, name: string, configDir?: string, noSpin = false): Promise<void> {
+async function cmdCreate(
+  topic: string,
+  name: string,
+  opts: { configDir?: string; noSpin?: boolean; auto?: boolean; yolo?: boolean } = {},
+): Promise<void> {
+  const { configDir, noSpin = false, auto = false, yolo = false } = opts;
   if (!/^[a-z][a-z0-9_-]*$/.test(name)) {
     return postToDispatch(topic, `invalid name \`${name}\` — must start with a lowercase letter and contain only [a-z0-9_-]`);
   }
@@ -834,6 +868,8 @@ async function cmdCreate(topic: string, name: string, configDir?: string, noSpin
     bot_api_key: botUser.api_key,
   };
   if (configDir) entry.config_dir = configDir;
+  if (auto) entry.auto = true;
+  if (yolo) entry.yolo = true;
   REGISTRY[name] = entry;
   saveRegistry(REGISTRY);
 
@@ -844,6 +880,8 @@ async function cmdCreate(topic: string, name: string, configDir?: string, noSpin
     `- working tree: \`${cwd}\``,
   ];
   if (configDir) lines.push(`- config dir: \`${configDir}\` (per-bot override)`);
+  if (yolo) lines.push(`- mode: **yolo** (\`--dangerously-skip-permissions\`, all prompts bypassed)`);
+  else if (auto) lines.push(`- mode: **auto** (non-danger prompts auto-approved; danger prompts still ask)`);
   if (noSpin) {
     lines.push(`Run \`spin up ${name}\` and tell it what kind of bot to be.`);
     await postToDispatch(topic, lines.join('\n'));
@@ -854,24 +892,32 @@ async function cmdCreate(topic: string, name: string, configDir?: string, noSpin
   await cmdSpinUp(topic, name);
 }
 
-// Mutate a bot's registry entry. Today only --config / --clear-config are
-// wired; the command shape supports adding more per-bot fields later. Changes
-// take effect on next spawn — running bots keep their old config until reset.
+// Mutate a bot's registry entry. Today --config / --clear-config / --auto /
+// --no-auto / --yolo / --no-yolo are wired; the command shape supports adding
+// more per-bot fields later. Changes take effect on next spawn — running bots
+// keep their old settings until reset.
 async function cmdUpdate(
   topic: string,
   name: string,
-  opts: { configDir?: string; clearConfig?: boolean },
+  opts: { configDir?: string; clearConfig?: boolean; auto?: boolean; yolo?: boolean },
 ): Promise<void> {
   const bot = REGISTRY[name];
   if (!bot) return postToDispatch(topic, `no bot named \`${name}\` in registry`);
 
-  // No flags → show current config-dir for this bot.
-  if (!opts.configDir && !opts.clearConfig) {
+  const hasFlag =
+    opts.configDir !== undefined ||
+    opts.clearConfig === true ||
+    opts.auto !== undefined ||
+    opts.yolo !== undefined;
+
+  // No flags → show current settings for this bot.
+  if (!hasFlag) {
     const effective = configDirFor(bot);
     const overridden = bot.config_dir ? ' (per-bot override)' : ' (global default)';
+    const mode = bot.yolo ? 'yolo' : bot.auto ? 'auto' : 'prompt';
     return postToDispatch(
       topic,
-      `@${name} config dir: \`${effective}\`${overridden}`,
+      `@${name} config dir: \`${effective}\`${overridden}; mode: **${mode}**`,
     );
   }
 
@@ -879,28 +925,36 @@ async function cmdUpdate(
     return postToDispatch(topic, `\`--config\` and \`--clear-config\` are mutually exclusive`);
   }
 
+  const configChanged = opts.configDir !== undefined || opts.clearConfig === true;
   if (opts.clearConfig) {
     delete bot.config_dir;
   } else if (opts.configDir) {
     bot.config_dir = opts.configDir;
   }
+  if (opts.auto === true) bot.auto = true;
+  else if (opts.auto === false) delete bot.auto;
+  if (opts.yolo === true) bot.yolo = true;
+  else if (opts.yolo === false) delete bot.yolo;
   saveRegistry(REGISTRY);
 
-  // Session jsonls live under the OLD config dir, so a `--resume <sid>` from
-  // the new dir would fail. Clear stored session_id so next spawn starts
-  // fresh. The bot's CLAUDE.md and HANDOFF.md (in cwd) still survive, so
-  // identity isn't lost — only the conversation history.
-  const state = readState(name);
-  state.session_id = null;
-  writeState(state);
+  // Only a config-dir change requires clearing session_id (jsonls live under
+  // the old config dir; --resume from the new dir would 404). auto/yolo
+  // don't move session storage, so the resume chain survives.
+  if (configChanged) {
+    const state = readState(name);
+    state.session_id = null;
+    writeState(state);
+  }
 
   const effective = configDirFor(bot);
-  const note = isAlive(name)
-    ? ` running session keeps the old config until you \`reset ${name}\` or it dies.`
+  const mode = bot.yolo ? 'yolo' : bot.auto ? 'auto' : 'prompt';
+  const sessionNote = configChanged ? ' Session cleared (next start is fresh).' : '';
+  const liveNote = isAlive(name)
+    ? ` Running session keeps the old settings until you \`reset ${name}\` or it dies.`
     : '';
   await postToDispatch(
     topic,
-    `@${name} config dir → \`${effective}\`. Session cleared (next start is fresh).${note}`,
+    `@${name} updated → config dir \`${effective}\`, mode **${mode}**.${sessionNote}${liveNote}`,
   );
 }
 
@@ -1199,8 +1253,8 @@ async function cmdHelp(topic: string): Promise<void> {
     ['spin up @<bot>', 'start that bot (resumes prior session if known)', 'wake, wake up, start'],
     ['shut down @<bot>', 'kill that bot (next start will resume)', 'stop, kill'],
     ['reset @<bot>', 'kill and clear stored session; next start is fresh'],
-    ['create <name> [--config <path>] [--no-spin]', 'provision a new bot end-to-end and spin it up (use --no-spin to skip)', 'create-bot'],
-    ['update <name> [--config <path> | --clear-config]', 'change a bot\'s per-bot settings (clears session so changes take effect)'],
+    ['create <name> [--config <path>] [--no-spin] [--auto] [--yolo]', 'provision a new bot end-to-end and spin it up. --auto = auto-approve non-danger prompts. --yolo = pass --dangerously-skip-permissions (bypasses ALL prompts including danger).', 'create-bot'],
+    ['update <name> [--config <path> | --clear-config] [--auto | --no-auto] [--yolo | --no-yolo]', 'change a bot\'s per-bot settings (config change clears session; auto/yolo apply on next spawn)'],
     ['retire <name>', 'kill, deactivate Zulip bot, archive stream, remove from registry'],
     ['list active', 'running bots + uptime', 'list'],
     ['status [@<bot>]', 'alive/sleeping + last activity (all bots if no name)'],
