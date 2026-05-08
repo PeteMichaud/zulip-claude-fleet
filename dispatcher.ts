@@ -375,6 +375,20 @@ async function spawnBot(bot: Bot, trigger: WakeTrigger): Promise<void> {
       await logWriter.flush();
       logWriter.end();
     } catch { /* non-fatal */ }
+
+    // Surface abnormal exits with the log tail. 0 = clean exit (rare for our
+    // PTY-driven sessions), 143 = our own SIGTERM (idle-shutdown / reset /
+    // retire — all expected). Anything else is unplanned: crash, OOM, etc.
+    if (exitCode !== 0 && exitCode !== 143) {
+      const tail = tailBotLog(bot.name, 20);
+      await postToBotHome(
+        bot.name,
+        `⚠️ @${bot.name} exited unexpectedly (code ${exitCode}). Last 20 log lines:\n\`\`\`\n${tail}\n\`\`\``,
+      );
+    }
+    // Clear any pending watchdog entry for this bot — a clean self-post
+    // can't arrive once the process is gone.
+    pendingReply.delete(bot.name);
   }).catch((err) => log(`@${bot.name} exit handler error: ${err.message}`));
 
   // First launch with --dangerously-load-development-channels shows a
@@ -460,16 +474,25 @@ async function handleMessage(event: any) {
   // bot (it's working — don't auto-idle-shut while it's mid-reply).
   if (isOwner) {
     bumpActivity(homeBot.name);
+    // Open a pending-reply window. If the bot doesn't post in its own home
+    // stream within NO_REPLY_THRESHOLD_MS, the watchdog (below) posts the
+    // last log lines so the operator can see why it's hung (e.g. credit
+    // exhaustion, rate limit, API error — Claude renders these in-place
+    // and waits for next input rather than exiting).
+    if (typeof msg.id === 'number') {
+      pendingReply.set(homeBot.name, { msgId: msg.id, sinceTime: Date.now() });
+    }
   } else if (issuingBot) {
     bumpActivity(issuingBot.name);
-    // Bot's own first post in its home stream after a spawn → spawn done,
-    // clear the ♻️ marker so 👀/✅ stand alone.
     if (issuingBot.name === homeBot.name) {
+      // Bot replied — the operator's message landed. Close both UI windows:
+      // the spawn-window ♻️ and the pending-reply watchdog.
       const inboundMsgId = pendingRecycle.get(homeBot.name);
       if (inboundMsgId !== undefined) {
         pendingRecycle.delete(homeBot.name);
         clearRecycle(inboundMsgId);
       }
+      pendingReply.delete(homeBot.name);
     }
   }
 
@@ -533,6 +556,62 @@ function clearRecycle(msgId: number): void {
     method: 'DELETE',
     params: { emoji_name: 'recycle' },
   }).catch((err: any) => log(`recycle: clear failed (non-fatal): ${err.message}`));
+}
+
+// ---------- No-reply watchdog ----------
+// Claude Code renders most error states (credit exhaustion, rate limits,
+// upstream 5xx) inline in its TTY and waits for next user input rather than
+// exiting. From the operator's perspective the bot just goes silent. This
+// watchdog detects "operator sent something, bot hasn't replied within N min"
+// and posts the last log lines into the bot's home stream so the underlying
+// error is visible without having to `logs <bot>` from #Dispatch.
+//
+// One-shot per inbound: cleared on the bot's first self-post (real reply) or
+// after the warning fires once. Reset on each new owner inbound.
+type PendingReply = { msgId: number; sinceTime: number };
+const pendingReply = new Map<string, PendingReply>();
+
+const NO_REPLY_THRESHOLD_MS = parseInt(
+  process.env.BOT_NO_REPLY_THRESHOLD_MS ?? String(10 * 60 * 1000),
+  10,
+);
+
+function tailBotLog(botName: string, lineCount: number): string {
+  const path = join(LOG_DIR, `${botName}.log`);
+  if (!existsSync(path)) return '(no log file)';
+  try {
+    const lines = readFileSync(path, 'utf-8').split('\n');
+    const tail = lines.slice(-lineCount).join('\n');
+    // Strip ANSI so the Zulip post is readable, then bound size for the
+    // 10k message limit (Zulip's hard cap; we leave headroom for framing).
+    return tail.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '').slice(-3000);
+  } catch (err: any) {
+    return `(log read failed: ${err.message})`;
+  }
+}
+
+async function postToBotHome(botName: string, content: string): Promise<void> {
+  const bot = REGISTRY[botName];
+  if (!bot) return;
+  await zulip('/messages', {
+    method: 'POST',
+    params: { type: 'stream', to: bot.home_stream, topic: 'lifecycle', content },
+  }).catch((err: any) => log(`@${botName} post to home stream failed: ${err.message}`));
+}
+
+async function checkNoReplyTimeouts(): Promise<void> {
+  const now = Date.now();
+  for (const [botName, entry] of pendingReply) {
+    if (now - entry.sinceTime < NO_REPLY_THRESHOLD_MS) continue;
+    pendingReply.delete(botName); // one-shot — don't re-warn for the same inbound
+    const elapsed = humanDuration(now - entry.sinceTime);
+    const tail = tailBotLog(botName, 20);
+    log(`@${botName}: no reply in ${elapsed} since msg ${entry.msgId} — posting log tail`);
+    await postToBotHome(
+      botName,
+      `⚠️ @${botName} hasn't replied in ${elapsed}. Last 20 log lines (often shows credit/rate-limit errors that Claude renders inline without exiting):\n\`\`\`\n${tail}\n\`\`\``,
+    );
+  }
 }
 
 // ---------- @-mention relay ----------
@@ -793,13 +872,15 @@ const shutdown = (sig: string) => {
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 
-// Periodic sweep for idle bots. Default threshold 30 minutes (overridable
-// via BOT_IDLE_TIMEOUT_MS env var). Cleared in shutdown handler.
+// Periodic sweep for idle bots and no-reply timeouts. Default thresholds:
+// 30m idle (BOT_IDLE_TIMEOUT_MS) and 10m no-reply (BOT_NO_REPLY_THRESHOLD_MS).
+// Cleared in shutdown handler.
 const idleTimer = setInterval(() => {
   if (!running) return;
   checkIdleBots().catch((err: any) => log(`idle sweep failed: ${err.message}`));
+  checkNoReplyTimeouts().catch((err: any) => log(`no-reply check failed: ${err.message}`));
 }, IDLE_CHECK_INTERVAL_MS);
-log(`idle shutdown enabled: ${humanDuration(IDLE_TIMEOUT_MS)} threshold, sweep every ${humanDuration(IDLE_CHECK_INTERVAL_MS)}`);
+log(`idle shutdown ${humanDuration(IDLE_TIMEOUT_MS)} / no-reply warn ${humanDuration(NO_REPLY_THRESHOLD_MS)}, sweep every ${humanDuration(IDLE_CHECK_INTERVAL_MS)}`);
 
 async function dispatchEventMessage(event: any): Promise<void> {
   await handleMessage(event);
