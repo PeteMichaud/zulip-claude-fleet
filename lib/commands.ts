@@ -143,10 +143,15 @@ function parseRest(rest: string): ParsedRest {
   return { positionals, flags };
 }
 
-function asTarget(s: string | undefined): string | undefined {
+// Strip leading @ or # and lowercase. Accepts only valid bot / stream names
+// (lowercase letter prefix, then lowercase alphanumeric / dash / underscore),
+// matching cmdCreate's validation regex. Returns undefined for anything else
+// — non-token text isn't a target reference. Shared with nl-dispatch so both
+// the regex parser and the NL fallback agree on what counts as a target.
+export function parseTargetToken(s: string | undefined): string | undefined {
   if (!s) return undefined;
-  const m = s.match(/^@?([\w-]+)$/);
-  return m ? m[1] : undefined;
+  const stripped = s.replace(/^[@#]/, '').toLowerCase();
+  return /^[a-z][a-z0-9_-]*$/.test(stripped) ? stripped : undefined;
 }
 
 export function parseCommand(text: string): Command {
@@ -159,7 +164,7 @@ export function parseCommand(text: string): Command {
   if (!head) return { kind: 'unknown', text: trimmed };
 
   const { positionals, flags } = parseRest(head.rest);
-  const target = asTarget(positionals[0]);
+  const target = parseTargetToken(positionals[0]);
 
   switch (head.kind) {
     case 'spinUp':
@@ -239,14 +244,14 @@ export function parseCommand(text: string): Command {
       return { kind: 'listFolders' };
 
     case 'setFolder': {
-      const stream = asTarget(positionals[0]);
+      const stream = parseTargetToken(positionals[0]);
       const folder = positionals[1];
       if (!stream || !folder) return { kind: 'unknown', text: trimmed };
       return { kind: 'setFolder', stream, folder };
     }
 
     case 'clearFolder': {
-      const stream = asTarget(positionals[0]);
+      const stream = parseTargetToken(positionals[0]);
       if (!stream) return { kind: 'unknown', text: trimmed };
       return { kind: 'clearFolder', stream };
     }

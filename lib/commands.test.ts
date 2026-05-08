@@ -1,5 +1,25 @@
 import { describe, expect, test } from 'bun:test';
-import { parseCommand } from './commands.ts';
+import { parseCommand, parseTargetToken } from './commands.ts';
+
+describe('parseTargetToken', () => {
+  test('strips leading @ or # and lowercases', () => {
+    expect(parseTargetToken('briefing')).toBe('briefing');
+    expect(parseTargetToken('@briefing')).toBe('briefing');
+    expect(parseTargetToken('#briefing')).toBe('briefing');
+    expect(parseTargetToken('Briefing')).toBe('briefing');
+    expect(parseTargetToken('@Writer-Bot')).toBe('writer-bot');
+  });
+
+  test('rejects invalid shapes', () => {
+    expect(parseTargetToken(undefined)).toBeUndefined();
+    expect(parseTargetToken('')).toBeUndefined();
+    expect(parseTargetToken('1bot')).toBeUndefined();           // digit prefix
+    expect(parseTargetToken('-bot')).toBeUndefined();           // dash prefix
+    expect(parseTargetToken('_bot')).toBeUndefined();           // underscore prefix
+    expect(parseTargetToken('bot with space')).toBeUndefined(); // whitespace
+    expect(parseTargetToken('bot.name')).toBeUndefined();       // dot
+  });
+});
 
 describe('parseCommand', () => {
   test('spin up (synonyms, hyphen-or-space between words)', () => {
