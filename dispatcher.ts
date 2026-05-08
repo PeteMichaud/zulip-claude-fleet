@@ -752,7 +752,10 @@ async function cmdCreate(topic: string, name: string, configDir?: string): Promi
       method: 'POST',
       params: {
         full_name: `${name}-bot`,
-        short_name: `${name}-bot`,
+        // Zulip auto-appends `-bot@<realm>` to short_name. Passing `<name>-bot`
+        // here produced `<name>-bot-bot@…`; pass the bare name and let Zulip
+        // synthesize the suffix.
+        short_name: name,
         bot_type: 1, // generic
       },
     });
