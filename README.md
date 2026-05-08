@@ -67,7 +67,15 @@ Test coverage and known gaps: [TESTING.md](TESTING.md).
 
 ## Status
 
-End-to-end working: JIT spawn (bot wakes when you message it), lifecycle commands (`spin up` / `shut down` / `reset` / `status` / `logs` / `list active`), persistent conversation continuity via `claude --resume` so context survives sleep/wake, fully automated `create-bot` / `retire`, permission relay with emoji reactions and a danger-pattern carve-out for things like `rm -rf`, inter-bot @-mention relay (`@editor` in `#writer` summons editor and reply lands back in `#writer` without subscribing every bot to every stream), and idle auto-shutdown after 30 minutes of inactivity.
+End-to-end working:
+
+- **JIT spawn** — bot wakes when you message it.
+- **Lifecycle commands** — `spin up` / `shut down` / `reset` / `status` / `logs` / `list active`.
+- **Persistent conversation continuity** via `claude --resume` so context survives sleep/wake.
+- **Fully automated `create-bot` / `retire`** — no manual Zulip UI steps.
+- **Permission relay** with emoji reactions and a danger-pattern carve-out for things like `rm -rf`.
+- **Inter-bot @-mention relay** — `@editor` in `#writer` summons editor and reply lands back in `#writer` without subscribing every bot to every stream.
+- **Idle auto-shutdown** after 30 minutes of inactivity.
 
 48 unit tests cover the pure helpers (command parsing, formatting, permission logic, Zulip client). Integration paths (process supervision, MCP wiring, real Zulip behavior) are manually verified by running through the quickstart above — see TESTING.md for what's covered vs. deferred.
 
