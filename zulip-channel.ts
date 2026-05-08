@@ -14,11 +14,13 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import { appendFileSync, existsSync, readFileSync, unlinkSync } from 'node:fs';
+import { join } from 'node:path';
 import { makeZulipClient } from './lib/zulip.ts';
 import { chunkMessage } from './lib/chunking.ts';
 import { formatPreview } from './lib/format.ts';
 import { isDangerousToolCall, PERMISSION_REPLY_RE } from './lib/permission.ts';
 import { makeHeartbeat } from './lib/heartbeat.ts';
+import { startJsonlActivityWatcher } from './lib/jsonl-tail.ts';
 import { appendAllowEntry, derivePattern, matchesAllow } from './lib/allowlist.ts';
 
 // ---------- Debug log ----------
@@ -51,8 +53,28 @@ let lastInbound: { stream: string; topic: string } = { stream: HOME_STREAM, topi
 // ---------- Zulip API client ----------
 const zulip = makeZulipClient({ site: SITE, email: BOT_EMAIL, apiKey: API_KEY });
 
-// Per-inbound liveness reactions (👀 → ✅) — see lib/heartbeat.ts.
+// Per-inbound liveness reactions (👀 → 🛠️ → ⌛ → ✓) — see lib/heartbeat.ts.
 const heartbeat = makeHeartbeat(zulip, debug);
+
+// Tail Claude's session JSONL so the heartbeat can swap 👀 → 🛠️ when Claude
+// is actively writing (tool calls, partial messages) and 🛠️ → ⌛ when it's
+// gone quiet for 30s. The JSONL lives at
+// <CLAUDE_CONFIG_DIR>/projects/<encoded-cwd>/<session>.jsonl — same path the
+// dispatcher uses for session_id discovery.
+{
+  const projectsDir = join(
+    process.env.CLAUDE_CONFIG_DIR ?? join(process.env.HOME ?? '', '.claude'),
+    'projects',
+    process.cwd().replaceAll('/', '-'),
+  );
+  const watcher = startJsonlActivityWatcher({
+    projectsDir,
+    onActivity: () => heartbeat.bumpActivity(),
+    log: debug,
+  });
+  process.on('SIGTERM', () => watcher.stop());
+  process.on('SIGINT', () => watcher.stop());
+}
 
 // ---------- Startup credential validation ----------
 let me: any;
