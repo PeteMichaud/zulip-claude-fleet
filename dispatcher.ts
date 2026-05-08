@@ -21,7 +21,8 @@ import { makeZulipClient } from './lib/zulip.ts';
 import { parseCommand } from './lib/commands.ts';
 import { humanDuration } from './lib/format.ts';
 import { isIdle, makeBotStateStore, type BotState } from './lib/state.ts';
-import { selfHealSubscriptions } from './lib/subs.ts';
+import { makeSpawnOrchestrator } from './lib/spawn-orchestrator.ts';
+import { runStartupSequence } from './lib/startup.ts';
 
 type Subprocess = ReturnType<typeof Bun.spawn>;
 type WakeTrigger = { stream: string; topic: string; sender: string; content: string; inbound_message_id?: number };
@@ -188,25 +189,17 @@ const writeState = stateStore.write;
 
 log('dispatcher starting');
 
-let me: any;
+let me: { email: string; user_id: number; [k: string]: unknown };
 try {
-  me = await zulip('/users/me');
+  ({ me } = await runStartupSequence({ zulip, registry: REGISTRY, log }));
 } catch (err: any) {
-  log('FATAL: Zulip auth failed at startup:', err.message);
+  log('FATAL:', err.message);
   process.exit(1);
 }
-log(`auth ok: ${me.email} (user_id ${me.user_id}); registered bots: [${Object.keys(REGISTRY).join(', ')}]`);
 
 // dispatch-bot's user_id, passed to spawned channel servers so they accept
 // our forward posts (@-mention relay, see processMentions below).
 const DISPATCH_BOT_USER_ID: number = me.user_id;
-
-await selfHealSubscriptions({
-  zulip,
-  myEmail: me.email,
-  streamNames: Object.values(REGISTRY).map((b) => b.home_stream),
-  log,
-});
 
 // ---------- Zulip event queue ----------
 
@@ -240,7 +233,6 @@ async function registerQueue() {
 // a master/slave pair, shuttles bytes between the parent's pipes and the
 // child's PTY, and forwards the exit code.
 const runningBots = new Map<string, Subprocess>();
-const spawnLocks = new Map<string, Promise<unknown>>();
 const startTimes = new Map<string, number>(); // botName -> ms timestamp at spawn
 
 function isAlive(botName: string): boolean {
@@ -372,32 +364,12 @@ async function spawnBot(bot: Bot, trigger: WakeTrigger): Promise<void> {
   }, 2000);
 }
 
-async function maybeSpawn(bot: Bot, trigger: WakeTrigger): Promise<void> {
-  // Serialize spawn attempts per bot. If a previous spawn is in flight,
-  // wait for it; the second caller may then find the bot already alive.
-  const previous = spawnLocks.get(bot.name);
-  let releaseLock!: () => void;
-  const lock = new Promise<void>((r) => { releaseLock = r; });
-  spawnLocks.set(bot.name, previous ? previous.then(() => lock) : lock);
-  if (previous) await previous;
-
-  try {
-    if (isAlive(bot.name)) {
-      log(`@${bot.name} already alive; not respawning (its own MCP will handle this inbound)`);
-      return;
-    }
-    // Reset the idle clock at spawn — last_active persists across sessions, so
-    // without this a long-asleep bot would be killed by the next idle sweep
-    // before it could process the wake trigger.
-    bumpActivity(bot.name);
-    await spawnBot(bot, trigger);
-  } catch (err: any) {
-    log(`@${bot.name} spawn failed: ${err.message}`);
-    // TODO: post failure into #Dispatch and set state.broken to the message.
-  } finally {
-    releaseLock();
-  }
-}
+const { maybeSpawn } = makeSpawnOrchestrator<Bot, WakeTrigger>({
+  isAlive,
+  bumpActivity,
+  spawnBot,
+  log,
+});
 
 // ---------- Inbound handler ----------
 
