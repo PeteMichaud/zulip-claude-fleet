@@ -12,151 +12,167 @@ function fakeSpawn(stdout: string, opts: Partial<SpawnResult> = {}): SpawnFn {
 }
 
 describe('parseClaudeResponse', () => {
-  test('clean single-line JSON', () => {
-    expect(parseClaudeResponse('{"kind":"spinUp","target":"writer"}')).toEqual({
-      kind: 'spinUp',
-      target: 'writer',
-    });
+  test('clean single-line JSON array', () => {
+    expect(parseClaudeResponse('[{"kind":"spinUp","target":"writer"}]')).toEqual([
+      { kind: 'spinUp', target: 'writer' },
+    ]);
   });
 
-  test('json fenced in markdown', () => {
-    const out = '```json\n{"kind":"status","target":"briefing"}\n```';
-    expect(parseClaudeResponse(out)).toEqual({ kind: 'status', target: 'briefing' });
+  test('multi-step plan in execution order', () => {
+    const out = '[{"kind":"createFolder","name":"SFC"},{"kind":"setFolder","stream":"briefing","folder":"SFC"}]';
+    expect(parseClaudeResponse(out)).toEqual([
+      { kind: 'createFolder', name: 'SFC' },
+      { kind: 'setFolder', stream: 'briefing', folder: 'SFC' },
+    ]);
   });
 
-  test('preamble before json', () => {
-    const out = 'Here is the command:\n{"kind":"listActive"}';
-    expect(parseClaudeResponse(out)).toEqual({ kind: 'listActive' });
+  test('json array fenced in markdown', () => {
+    const out = '```json\n[{"kind":"status","target":"briefing"}]\n```';
+    expect(parseClaudeResponse(out)).toEqual([{ kind: 'status', target: 'briefing' }]);
+  });
+
+  test('preamble before json array', () => {
+    const out = 'Here is the plan:\n[{"kind":"listActive"}]';
+    expect(parseClaudeResponse(out)).toEqual([{ kind: 'listActive' }]);
+  });
+
+  test('empty array means "no command"', () => {
+    expect(parseClaudeResponse('[]')).toEqual([]);
   });
 
   test('malformed json returns null', () => {
-    expect(parseClaudeResponse('{not json')).toBeNull();
+    expect(parseClaudeResponse('[not json')).toBeNull();
     expect(parseClaudeResponse('')).toBeNull();
   });
 
-  test('kind:none returns null', () => {
-    expect(parseClaudeResponse('{"kind":"none"}')).toBeNull();
+  test('non-array top level returns null', () => {
+    // The protocol is "always an array" — a single object is malformed.
+    expect(parseClaudeResponse('{"kind":"spinUp","target":"writer"}')).toBeNull();
+  });
+
+  test('any invalid element fails the whole plan', () => {
+    expect(parseClaudeResponse('[{"kind":"spinUp","target":"writer"},{"kind":"explode"}]')).toBeNull();
   });
 
   test('strips leading @ on target', () => {
-    expect(parseClaudeResponse('{"kind":"spinUp","target":"@writer"}')).toEqual({
-      kind: 'spinUp',
-      target: 'writer',
-    });
+    expect(parseClaudeResponse('[{"kind":"spinUp","target":"@writer"}]')).toEqual([
+      { kind: 'spinUp', target: 'writer' },
+    ]);
   });
 
   test('strips leading # on stream', () => {
-    expect(parseClaudeResponse('{"kind":"setFolder","stream":"#linear","folder":"work"}')).toEqual({
-      kind: 'setFolder',
-      stream: 'linear',
-      folder: 'work',
-    });
+    expect(parseClaudeResponse('[{"kind":"setFolder","stream":"#linear","folder":"work"}]')).toEqual([
+      { kind: 'setFolder', stream: 'linear', folder: 'work' },
+    ]);
   });
 
   test('lowercases target', () => {
-    expect(parseClaudeResponse('{"kind":"shutDown","target":"Writer"}')).toEqual({
-      kind: 'shutDown',
-      target: 'writer',
-    });
+    expect(parseClaudeResponse('[{"kind":"shutDown","target":"Writer"}]')).toEqual([
+      { kind: 'shutDown', target: 'writer' },
+    ]);
   });
 
-  test('rejects unknown kind', () => {
-    expect(parseClaudeResponse('{"kind":"explode","target":"writer"}')).toBeNull();
+  test('preserves folder name case (descriptive label, not identifier)', () => {
+    expect(parseClaudeResponse('[{"kind":"createFolder","name":"SFC"}]')).toEqual([
+      { kind: 'createFolder', name: 'SFC' },
+    ]);
+    expect(parseClaudeResponse('[{"kind":"createFolder","name":"Personal"}]')).toEqual([
+      { kind: 'createFolder', name: 'Personal' },
+    ]);
   });
 
   test('rejects targetless verb', () => {
-    expect(parseClaudeResponse('{"kind":"spinUp"}')).toBeNull();
-    expect(parseClaudeResponse('{"kind":"reset"}')).toBeNull();
+    expect(parseClaudeResponse('[{"kind":"spinUp"}]')).toBeNull();
+    expect(parseClaudeResponse('[{"kind":"reset"}]')).toBeNull();
   });
 
   test('rejects invalid token in target', () => {
-    expect(parseClaudeResponse('{"kind":"spinUp","target":"my bot"}')).toBeNull();
-    expect(parseClaudeResponse('{"kind":"spinUp","target":""}')).toBeNull();
+    expect(parseClaudeResponse('[{"kind":"spinUp","target":"my bot"}]')).toBeNull();
+    expect(parseClaudeResponse('[{"kind":"spinUp","target":""}]')).toBeNull();
   });
 
   test('status without target is fleet-wide', () => {
-    expect(parseClaudeResponse('{"kind":"status"}')).toEqual({ kind: 'status', target: undefined });
+    expect(parseClaudeResponse('[{"kind":"status"}]')).toEqual([
+      { kind: 'status', target: undefined },
+    ]);
   });
 
   test('create with optional flags', () => {
-    expect(parseClaudeResponse('{"kind":"create","target":"writer","configDir":"~/.claude-mimo"}')).toEqual({
-      kind: 'create',
-      target: 'writer',
-      configDir: '~/.claude-mimo',
-    });
-    expect(parseClaudeResponse('{"kind":"create","target":"writer","noSpin":true}')).toEqual({
-      kind: 'create',
-      target: 'writer',
-      noSpin: true,
-    });
+    expect(parseClaudeResponse('[{"kind":"create","target":"writer","configDir":"~/.claude-mimo"}]')).toEqual([
+      { kind: 'create', target: 'writer', configDir: '~/.claude-mimo' },
+    ]);
+    expect(parseClaudeResponse('[{"kind":"create","target":"writer","noSpin":true}]')).toEqual([
+      { kind: 'create', target: 'writer', noSpin: true },
+    ]);
   });
 
   test('logs defaults n to 30', () => {
-    expect(parseClaudeResponse('{"kind":"logs","target":"writer"}')).toEqual({
-      kind: 'logs',
-      target: 'writer',
-      n: 30,
-    });
-    expect(parseClaudeResponse('{"kind":"logs","target":"writer","n":100}')).toEqual({
-      kind: 'logs',
-      target: 'writer',
-      n: 100,
-    });
+    expect(parseClaudeResponse('[{"kind":"logs","target":"writer"}]')).toEqual([
+      { kind: 'logs', target: 'writer', n: 30 },
+    ]);
+    expect(parseClaudeResponse('[{"kind":"logs","target":"writer","n":100}]')).toEqual([
+      { kind: 'logs', target: 'writer', n: 100 },
+    ]);
   });
 
   test('createFolder with description', () => {
-    expect(parseClaudeResponse('{"kind":"createFolder","name":"work","description":"day-job stuff"}')).toEqual({
-      kind: 'createFolder',
-      name: 'work',
-      description: 'day-job stuff',
-    });
+    expect(parseClaudeResponse('[{"kind":"createFolder","name":"Work","description":"day-job stuff"}]')).toEqual([
+      { kind: 'createFolder', name: 'Work', description: 'day-job stuff' },
+    ]);
   });
 
   test('help', () => {
-    expect(parseClaudeResponse('{"kind":"help"}')).toEqual({ kind: 'help' });
+    expect(parseClaudeResponse('[{"kind":"help"}]')).toEqual([{ kind: 'help' }]);
   });
 });
 
 describe('nlDispatch', () => {
-  test('returns Command from spawned stdout', async () => {
-    const cmd = await nlDispatch('start writer', {
-      spawn: fakeSpawn('{"kind":"spinUp","target":"writer"}'),
+  test('returns plan from spawned stdout', async () => {
+    const plan = await nlDispatch('start writer', {
+      spawn: fakeSpawn('[{"kind":"spinUp","target":"writer"}]'),
     });
-    expect(cmd).toEqual({ kind: 'spinUp', target: 'writer' });
+    expect(plan).toEqual([{ kind: 'spinUp', target: 'writer' }]);
+  });
+
+  test('multi-step plan returned in order', async () => {
+    const plan = await nlDispatch('pin briefing then create folder X', {
+      spawn: fakeSpawn('[{"kind":"pin","target":"briefing"},{"kind":"createFolder","name":"X"}]'),
+    });
+    expect(plan).toEqual([
+      { kind: 'pin', target: 'briefing' },
+      { kind: 'createFolder', name: 'X' },
+    ]);
   });
 
   test('non-zero exit returns null', async () => {
-    const cmd = await nlDispatch('start writer', {
-      spawn: fakeSpawn('{"kind":"spinUp","target":"writer"}', { code: 1 }),
-    });
-    expect(cmd).toBeNull();
+    expect(
+      await nlDispatch('x', { spawn: fakeSpawn('[]', { code: 1 }) }),
+    ).toBeNull();
   });
 
   test('timeout returns null', async () => {
-    const cmd = await nlDispatch('start writer', {
-      spawn: fakeSpawn('', { timedOut: true }),
-    });
-    expect(cmd).toBeNull();
+    expect(
+      await nlDispatch('x', { spawn: fakeSpawn('', { timedOut: true }) }),
+    ).toBeNull();
   });
 
   test('thrown spawn returns null', async () => {
-    const cmd = await nlDispatch('start writer', {
-      spawn: async () => { throw new Error('claude not on PATH'); },
-    });
-    expect(cmd).toBeNull();
+    expect(
+      await nlDispatch('x', { spawn: async () => { throw new Error('claude not on PATH'); } }),
+    ).toBeNull();
   });
 
   test('passes claude CLI args including --print, --model, --append-system-prompt', async () => {
     let capturedArgs: string[] = [];
     let capturedInput = '';
-    const cmd = await nlDispatch('shut down writer', {
+    const plan = await nlDispatch('shut down writer', {
       spawn: async (args, input) => {
         capturedArgs = args;
         capturedInput = input;
-        return { stdout: '{"kind":"shutDown","target":"writer"}', stderr: '', code: 0, timedOut: false };
+        return { stdout: '[{"kind":"shutDown","target":"writer"}]', stderr: '', code: 0, timedOut: false };
       },
     });
-    expect(cmd).toEqual({ kind: 'shutDown', target: 'writer' });
+    expect(plan).toEqual([{ kind: 'shutDown', target: 'writer' }]);
     expect(capturedArgs[0]).toBe('claude');
     expect(capturedArgs).toContain('--print');
     expect(capturedArgs).toContain('--model');
@@ -170,7 +186,7 @@ describe('nlDispatch', () => {
       model: 'claude-sonnet-4-6',
       spawn: async (args) => {
         capturedArgs = args;
-        return { stdout: '{"kind":"none"}', stderr: '', code: 0, timedOut: false };
+        return { stdout: '[]', stderr: '', code: 0, timedOut: false };
       },
     });
     const modelIdx = capturedArgs.indexOf('--model');
@@ -183,7 +199,7 @@ describe('nlDispatch', () => {
       timeoutMs: 5000,
       spawn: async (_args, _input, t) => {
         capturedTimeout = t;
-        return { stdout: '{"kind":"none"}', stderr: '', code: 0, timedOut: false };
+        return { stdout: '[]', stderr: '', code: 0, timedOut: false };
       },
     });
     expect(capturedTimeout).toBe(5000);
