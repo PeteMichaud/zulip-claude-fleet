@@ -12,6 +12,12 @@ export type Command =
   | { kind: 'listActive' }
   | { kind: 'status'; target: string | undefined }
   | { kind: 'logs'; target: string; n: number }
+  | { kind: 'pin'; target: string }
+  | { kind: 'unpin'; target: string }
+  | { kind: 'createFolder'; name: string; description?: string }
+  | { kind: 'listFolders' }
+  | { kind: 'setFolder'; stream: string; folder: string }
+  | { kind: 'clearFolder'; stream: string }
   | { kind: 'help' }
   | { kind: 'unknown'; text: string };
 
@@ -46,6 +52,15 @@ const HEADS: Array<{ phrase: string; kind: HeadKind }> = [
   { phrase: 'create bot', kind: 'create' },
   { phrase: 'create-bot', kind: 'create' },
   { phrase: 'createbot', kind: 'create' },
+  { phrase: 'create folder', kind: 'createFolder' },
+  { phrase: 'create-folder', kind: 'createFolder' },
+  { phrase: 'createfolder', kind: 'createFolder' },
+  { phrase: 'list folders', kind: 'listFolders' },
+  { phrase: 'list-folders', kind: 'listFolders' },
+  { phrase: 'set folder', kind: 'setFolder' },
+  { phrase: 'set-folder', kind: 'setFolder' },
+  { phrase: 'clear folder', kind: 'clearFolder' },
+  { phrase: 'clear-folder', kind: 'clearFolder' },
   // 1-word heads.
   { phrase: 'wake', kind: 'spinUp' },
   { phrase: 'start', kind: 'spinUp' },
@@ -59,6 +74,8 @@ const HEADS: Array<{ phrase: string; kind: HeadKind }> = [
   { phrase: 'status', kind: 'status' },
   { phrase: 'logs', kind: 'logs' },
   { phrase: 'log', kind: 'logs' },
+  { phrase: 'pin', kind: 'pin' },
+  { phrase: 'unpin', kind: 'unpin' },
   { phrase: 'help', kind: 'help' },
 ];
 
@@ -71,6 +88,10 @@ export const ALIASES: Partial<Record<HeadKind, string[]>> = {
   create: ['create-bot'],
   listActive: ['list'],
   logs: ['log'],
+  createFolder: ['create-folder'],
+  listFolders: ['list-folders'],
+  setFolder: ['set-folder'],
+  clearFolder: ['clear-folder'],
 };
 
 function matchHead(text: string): { kind: HeadKind; rest: string } | null {
@@ -174,6 +195,37 @@ export function parseCommand(text: string): Command {
       const nArg = positionals[1];
       const n = nArg && /^\d+$/.test(nArg) ? parseInt(nArg, 10) : DEFAULT_LOG_LINES;
       return { kind: 'logs', target, n };
+    }
+
+    case 'pin':
+    case 'unpin': {
+      if (!target) return { kind: 'unknown', text: trimmed };
+      return { kind: head.kind, target };
+    }
+
+    case 'createFolder': {
+      const name = positionals[0];
+      if (!name) return { kind: 'unknown', text: trimmed };
+      const descFlag = flags.get('description');
+      const out: Command = { kind: 'createFolder', name };
+      if (typeof descFlag === 'string') out.description = descFlag;
+      return out;
+    }
+
+    case 'listFolders':
+      return { kind: 'listFolders' };
+
+    case 'setFolder': {
+      const stream = asTarget(positionals[0]);
+      const folder = positionals[1];
+      if (!stream || !folder) return { kind: 'unknown', text: trimmed };
+      return { kind: 'setFolder', stream, folder };
+    }
+
+    case 'clearFolder': {
+      const stream = asTarget(positionals[0]);
+      if (!stream) return { kind: 'unknown', text: trimmed };
+      return { kind: 'clearFolder', stream };
     }
 
     case 'help':
