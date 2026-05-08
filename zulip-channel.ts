@@ -19,6 +19,7 @@ import { chunkMessage } from './lib/chunking.ts';
 import { formatPreview } from './lib/format.ts';
 import { isDangerousToolCall, PERMISSION_REPLY_RE } from './lib/permission.ts';
 import { makeHeartbeat } from './lib/heartbeat.ts';
+import { appendAllowEntry, derivePattern, matchesAllow } from './lib/allowlist.ts';
 
 // ---------- Debug log ----------
 // stderr from MCP servers goes somewhere we can't easily find;
@@ -176,8 +177,26 @@ async function readTool(args: { stream: string; limit?: number; anchor?: string 
 }
 
 // ---------- Permission relay ----------
-// Map: Zulip message id of the prompt -> Claude's request_id
-const pendingPermissions = new Map<string, string>();
+// Map: Zulip message id of the prompt -> Claude's request_id + the original
+// tool_name/input_preview, so we can derive an auto-allowlist pattern when
+// the operator taps ♾️.
+type PendingPermission = {
+  request_id: string;
+  tool_name: string;
+  input_preview: string;
+};
+const pendingPermissions = new Map<string, PendingPermission>();
+
+// settings.local.json lives under the bot's cwd at this stable relative path
+// (cmdCreate scaffolds it on bot creation, dispatcher.ts:801).
+const SETTINGS_LOCAL_PATH = '.claude/settings.local.json';
+
+// Runtime allowlist — patterns added via ♾️ during this session. Claude Code
+// snapshots its own permissions at session start, so writes to settings.local.json
+// only take effect on the next spawn. This in-memory list bypasses that: when a
+// fresh permission_request comes in, we check it here BEFORE posting to Zulip,
+// and auto-emit allow if any pattern matches. Effective immediately, no reload.
+const runtimeAllowlist = new Set<string>();
 
 const PermissionRequestSchema = z.object({
   method: z.literal('notifications/claude/channel/permission_request'),
@@ -191,7 +210,25 @@ const PermissionRequestSchema = z.object({
 
 mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }) => {
   debug('permission_request:', { id: params.request_id, tool: params.tool_name, desc: params.description });
+
   const dangerous = isDangerousToolCall(params.tool_name, params.input_preview);
+
+  // Runtime allowlist: if any pattern from a prior ♾️ tap in this session
+  // matches, auto-emit allow without bothering the operator. Bypasses the
+  // Zulip prompt entirely. Danger patterns can't be auto-allowed — runtime
+  // allows are always overridden by the danger filter.
+  if (!dangerous) {
+    for (const pattern of runtimeAllowlist) {
+      if (matchesAllow(params.tool_name, params.input_preview, pattern)) {
+        debug('runtime allowlist hit:', { pattern, request_id: params.request_id });
+        await mcp.notification({
+          method: 'notifications/claude/channel/permission',
+          params: { request_id: params.request_id, behavior: 'allow' },
+        });
+        return;
+      }
+    }
+  }
 
   const header = dangerous
     ? `⚠️ **${params.tool_name}** · \`${params.request_id}\` · typed verdict only`
@@ -216,15 +253,20 @@ mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }) => {
     return; // Claude Code's local dialog still works; we just couldn't relay
   }
 
-  pendingPermissions.set(String(sentMsgId), params.request_id);
+  pendingPermissions.set(String(sentMsgId), {
+    request_id: params.request_id,
+    tool_name: params.tool_name,
+    input_preview: params.input_preview,
+  });
 
   if (!dangerous) {
-    // Pre-populate reactions for tap-to-approve. Sequential so ✅ always
-    // appears before ❌ — concurrent POSTs race and invert muscle memory.
-    // Non-fatal if either fails.
+    // Pre-populate reactions for tap-to-approve. Sequential so order is
+    // stable: ✅ approve · ❌ deny · ♾️ approve+remember. Concurrent POSTs
+    // race and invert muscle memory. Non-fatal if any fails.
     try {
       await zulip(`/messages/${sentMsgId}/reactions`, { method: 'POST', params: { emoji_name: 'check' } });
       await zulip(`/messages/${sentMsgId}/reactions`, { method: 'POST', params: { emoji_name: 'cross_mark' } });
+      await zulip(`/messages/${sentMsgId}/reactions`, { method: 'POST', params: { emoji_name: 'infinity' } });
     } catch (err: any) {
       debug('permission relay: pre-react failed (non-fatal):', err.message);
     }
@@ -237,12 +279,41 @@ async function emitVerdict(requestId: string, behavior: 'allow' | 'deny') {
     params: { request_id: requestId, behavior },
   });
   // Clean up pendingPermissions by request_id (reverse lookup; map is small)
-  for (const [msgId, rid] of pendingPermissions) {
-    if (rid === requestId) {
+  for (const [msgId, p] of pendingPermissions) {
+    if (p.request_id === requestId) {
       pendingPermissions.delete(msgId);
       break;
     }
   }
+}
+
+// ♾️ tap: approve THIS call, register the pattern in the runtime allowlist
+// (matching prompts skip Zulip the rest of this session), AND persist it to
+// .claude/settings.local.json so future spawns skip the prompt too.
+async function handleAutoAllow(pending: PendingPermission, replyTo: { stream: string; topic: string }): Promise<void> {
+  await emitVerdict(pending.request_id, 'allow');
+
+  const pattern = derivePattern(pending.tool_name, pending.input_preview);
+  runtimeAllowlist.add(pattern); // mid-session effect, no Claude Code reload
+
+  let body: string;
+  try {
+    const result = appendAllowEntry(SETTINGS_LOCAL_PATH, pattern);
+    if (result.added) {
+      body = `♾️ approved + added \`${pattern}\` to allowlist (effective now and on future spawns).`;
+      debug('auto-allow: appended', { pattern, request_id: pending.request_id });
+    } else {
+      body = `♾️ approved (\`${pattern}\` already in allowlist).`;
+    }
+  } catch (err: any) {
+    body = `♾️ approved + auto-allowing \`${pattern}\` for this session, but persisting to settings.local.json failed: ${err.message}`;
+    debug('auto-allow: write failed:', err.message);
+  }
+
+  zulip('/messages', {
+    method: 'POST',
+    params: { type: 'stream', to: replyTo.stream, topic: replyTo.topic, content: body },
+  }).catch((err: any) => debug('auto-allow: post-back failed (non-fatal):', err.message));
 }
 
 // ---------- Connect MCP ----------
@@ -384,8 +455,14 @@ async function handleReaction(event: any) {
   if (event.op !== 'add') return;
   if (event.user_id !== OWNER_USER_ID) return;
   const msgId = String(event.message_id);
-  const requestId = pendingPermissions.get(msgId);
-  if (!requestId) return;
+  const pending = pendingPermissions.get(msgId);
+  if (!pending) return;
+
+  if (event.emoji_name === 'infinity') {
+    debug('reaction verdict: ♾️ auto-allow', { request_id: pending.request_id });
+    await handleAutoAllow(pending, lastInbound);
+    return;
+  }
 
   const verdict =
     event.emoji_name === 'check' ? 'allow' :
@@ -393,8 +470,8 @@ async function handleReaction(event: any) {
     null;
   if (!verdict) return;
 
-  debug('reaction verdict:', { request_id: requestId, behavior: verdict, emoji: event.emoji_name });
-  await emitVerdict(requestId, verdict);
+  debug('reaction verdict:', { request_id: pending.request_id, behavior: verdict, emoji: event.emoji_name });
+  await emitVerdict(pending.request_id, verdict);
 }
 
 await registerQueue();
