@@ -1,11 +1,13 @@
-// Parser for fleet-ops commands posted in #Dispatch. Pure (regex against
-// trimmed text) so it's trivial to unit-test.
+// Parser for fleet-ops commands posted in #Dispatch. Tokenizes the input,
+// matches a (possibly multi-word) command head, then parses positionals and
+// `--flag value` pairs from the rest. Pure so it's trivial to unit-test.
 
 export type Command =
   | { kind: 'spinUp'; target: string }
   | { kind: 'shutDown'; target: string }
   | { kind: 'reset'; target: string }
-  | { kind: 'createBot'; target: string }
+  | { kind: 'create'; target: string; configDir?: string }
+  | { kind: 'update'; target: string; configDir?: string; clearConfig?: boolean }
   | { kind: 'retire'; target: string }
   | { kind: 'listActive' }
   | { kind: 'status'; target: string | undefined }
@@ -15,10 +17,9 @@ export type Command =
 
 const DEFAULT_LOG_LINES = 30;
 
-// Convert Zulip-formal @**Display Name** mentions to informal @name so
-// the command regexes (which expect [\w-]+ targets) can match. Also drops
-// the `-bot` suffix Zulip's autocomplete inserts (full_name is `<name>-bot`
-// but the registry is keyed by `<name>`).
+// Convert Zulip-formal @**Display Name** mentions to informal @name so the
+// target regex matches. Drops the `-bot` suffix Zulip's autocomplete inserts
+// (full_name is `<name>-bot` but the registry is keyed by `<name>`).
 function normalizeMentions(text: string): string {
   return text.replace(
     /@\*\*([^*]+)\*\*/g,
@@ -26,36 +27,152 @@ function normalizeMentions(text: string): string {
   );
 }
 
-export function parseCommand(text: string): Command {
-  const t = normalizeMentions(text.trim());
+type HeadKind = Exclude<Command['kind'], 'unknown'>;
 
-  let m;
-  if ((m = t.match(/^(?:spin[\s-]+up|wake[\s-]+up|wake|start)\s+@?([\w-]+)\s*$/i))) {
-    return { kind: 'spinUp', target: m[1] };
+// Each entry is one alias for a command head. `phrase` is matched
+// case-insensitively against the start of the input, with a whole-word
+// boundary (end of string or whitespace). Multi-word phrases come first so
+// `spin up` is tried before `spin`.
+const HEADS: Array<{ phrase: string; kind: HeadKind }> = [
+  // 2-word heads + their hyphen-glued 1-token variants.
+  { phrase: 'spin up', kind: 'spinUp' },
+  { phrase: 'spin-up', kind: 'spinUp' },
+  { phrase: 'wake up', kind: 'spinUp' },
+  { phrase: 'wake-up', kind: 'spinUp' },
+  { phrase: 'shut down', kind: 'shutDown' },
+  { phrase: 'shut-down', kind: 'shutDown' },
+  { phrase: 'list active', kind: 'listActive' },
+  { phrase: 'list-active', kind: 'listActive' },
+  { phrase: 'create bot', kind: 'create' },
+  { phrase: 'create-bot', kind: 'create' },
+  { phrase: 'createbot', kind: 'create' },
+  // 1-word heads.
+  { phrase: 'wake', kind: 'spinUp' },
+  { phrase: 'start', kind: 'spinUp' },
+  { phrase: 'stop', kind: 'shutDown' },
+  { phrase: 'kill', kind: 'shutDown' },
+  { phrase: 'reset', kind: 'reset' },
+  { phrase: 'create', kind: 'create' },
+  { phrase: 'update', kind: 'update' },
+  { phrase: 'retire', kind: 'retire' },
+  { phrase: 'list', kind: 'listActive' },
+  { phrase: 'status', kind: 'status' },
+  { phrase: 'logs', kind: 'logs' },
+  { phrase: 'log', kind: 'logs' },
+  { phrase: 'help', kind: 'help' },
+];
+
+// Aliases surfaced in the help text. Keep in sync with HEADS — manually,
+// since we want a friendly canonical form per kind rather than dumping every
+// variant Zulip-mentions, hyphenated, etc. produce.
+export const ALIASES: Partial<Record<HeadKind, string[]>> = {
+  spinUp: ['wake', 'wake up', 'start'],
+  shutDown: ['stop', 'kill'],
+  create: ['create-bot'],
+  listActive: ['list'],
+  logs: ['log'],
+};
+
+function matchHead(text: string): { kind: HeadKind; rest: string } | null {
+  const lower = text.toLowerCase();
+  for (const h of HEADS) {
+    const p = h.phrase.toLowerCase();
+    if (lower === p) return { kind: h.kind, rest: '' };
+    if (lower.startsWith(p) && /\s/.test(lower[p.length] ?? '')) {
+      return { kind: h.kind, rest: text.slice(h.phrase.length).trim() };
+    }
   }
-  if ((m = t.match(/^(?:shut[\s-]+down|stop|kill)\s+@?([\w-]+)\s*$/i))) {
-    return { kind: 'shutDown', target: m[1] };
+  return null;
+}
+
+type ParsedRest = {
+  positionals: string[];
+  flags: Map<string, string | true>;
+};
+
+// argv-style: `--key value` consumes two tokens, `--key=value` one,
+// `--key` alone is boolean true (followed by another --flag or end-of-input).
+function parseRest(rest: string): ParsedRest {
+  const tokens = rest.split(/\s+/).filter(Boolean);
+  const positionals: string[] = [];
+  const flags = new Map<string, string | true>();
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i];
+    if (t.startsWith('--')) {
+      const eq = t.indexOf('=');
+      if (eq > -1) {
+        flags.set(t.slice(2, eq), t.slice(eq + 1));
+      } else if (i + 1 < tokens.length && !tokens[i + 1].startsWith('--')) {
+        flags.set(t.slice(2), tokens[i + 1]);
+        i++;
+      } else {
+        flags.set(t.slice(2), true);
+      }
+    } else {
+      positionals.push(t);
+    }
   }
-  if ((m = t.match(/^reset\s+@?([\w-]+)\s*$/i))) {
-    return { kind: 'reset', target: m[1] };
+  return { positionals, flags };
+}
+
+function asTarget(s: string | undefined): string | undefined {
+  if (!s) return undefined;
+  const m = s.match(/^@?([\w-]+)$/);
+  return m ? m[1] : undefined;
+}
+
+export function parseCommand(text: string): Command {
+  // Collapse internal whitespace so 'shut  down briefing' parses the same
+  // as 'shut down briefing'. Multi-word heads expect single-space form.
+  const trimmed = normalizeMentions(text.trim()).replace(/\s+/g, ' ');
+  if (!trimmed) return { kind: 'unknown', text: '' };
+
+  const head = matchHead(trimmed);
+  if (!head) return { kind: 'unknown', text: trimmed };
+
+  const { positionals, flags } = parseRest(head.rest);
+  const target = asTarget(positionals[0]);
+
+  switch (head.kind) {
+    case 'spinUp':
+    case 'shutDown':
+    case 'reset':
+    case 'retire':
+      if (!target) return { kind: 'unknown', text: trimmed };
+      return { kind: head.kind, target };
+
+    case 'create': {
+      if (!target) return { kind: 'unknown', text: trimmed };
+      const configFlag = flags.get('config');
+      const configDir = typeof configFlag === 'string' ? configFlag : undefined;
+      return configDir ? { kind: 'create', target, configDir } : { kind: 'create', target };
+    }
+
+    case 'update': {
+      if (!target) return { kind: 'unknown', text: trimmed };
+      const configFlag = flags.get('config');
+      const clearConfig = flags.get('clear-config') === true;
+      const configDir = typeof configFlag === 'string' ? configFlag : undefined;
+      const out: Command = { kind: 'update', target };
+      if (configDir) out.configDir = configDir;
+      if (clearConfig) out.clearConfig = true;
+      return out;
+    }
+
+    case 'listActive':
+      return { kind: 'listActive' };
+
+    case 'status':
+      return { kind: 'status', target };
+
+    case 'logs': {
+      if (!target) return { kind: 'unknown', text: trimmed };
+      const nArg = positionals[1];
+      const n = nArg && /^\d+$/.test(nArg) ? parseInt(nArg, 10) : DEFAULT_LOG_LINES;
+      return { kind: 'logs', target, n };
+    }
+
+    case 'help':
+      return { kind: 'help' };
   }
-  if ((m = t.match(/^create[\s-]?bot\s+@?([\w-]+)\s*$/i))) {
-    return { kind: 'createBot', target: m[1] };
-  }
-  if ((m = t.match(/^retire\s+@?([\w-]+)\s*$/i))) {
-    return { kind: 'retire', target: m[1] };
-  }
-  if (/^list([\s-]+active)?\s*$/i.test(t)) {
-    return { kind: 'listActive' };
-  }
-  if ((m = t.match(/^status(?:\s+@?([\w-]+))?\s*$/i))) {
-    return { kind: 'status', target: m[1] };
-  }
-  if ((m = t.match(/^logs?\s+@?([\w-]+)(?:\s+(\d+))?\s*$/i))) {
-    return { kind: 'logs', target: m[1], n: m[2] ? parseInt(m[2], 10) : DEFAULT_LOG_LINES };
-  }
-  if (/^help\s*$/i.test(t)) {
-    return { kind: 'help' };
-  }
-  return { kind: 'unknown', text: t };
 }

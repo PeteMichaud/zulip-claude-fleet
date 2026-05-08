@@ -9,7 +9,7 @@ Each bot is a long-running Claude session living in its own Zulip stream. A disp
 In `#Dispatch`:
 
 ```
-you:         create-bot writer
+you:         create writer
 @dispatch:   ✓ @writer created
              - bot user: writer-bot-bot@your-realm.zulipchat.com
              - home stream: #writer
@@ -58,8 +58,9 @@ bun run dispatcher
 
 Then, in `#Dispatch` from your Zulip client:
 
-- `help` — full command list
-- `create-bot <name>` — provision a new bot end-to-end
+- `help` — full command list (with aliases)
+- `create <name> [--config <path>]` — provision a new bot end-to-end
+- `update <name> --config <path>` — change a bot's per-bot Claude config dir
 - `spin up <name>` / `shut down <name>` / `reset <name>` — lifecycle
 - `retire <name>` — fully decommission
 
@@ -72,7 +73,8 @@ End-to-end working:
 - **JIT spawn** — bot wakes when you message it.
 - **Lifecycle commands** — `spin up` / `shut down` / `reset` / `status` / `logs` / `list active`.
 - **Persistent conversation continuity** via `claude --resume` so context survives sleep/wake.
-- **Fully automated `create-bot` / `retire`** — no manual Zulip UI steps.
+- **Fully automated `create` / `retire`** — no manual Zulip UI steps.
+- **Per-bot Claude config dir** — `create writer --config ~/.claude-mimo` (or `update`) so a single fleet can mix bots running under different Claude profiles.
 - **Permission relay** with emoji reactions and a danger-pattern carve-out for things like `rm -rf`.
 - **Inter-bot @-mention relay** — `@editor` in `#writer` summons editor and reply lands back in `#writer` without subscribing every bot to every stream.
 - **Idle auto-shutdown** after 30 minutes of inactivity.

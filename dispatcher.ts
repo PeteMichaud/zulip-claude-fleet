@@ -44,6 +44,10 @@ type Bot = {
   cwd: string;
   bot_email: string;
   bot_api_key: string;
+  // Optional per-bot override. When unset, the bot inherits the dispatcher's
+  // global default (CLAUDE_CONFIG_DIR env or ~/.claude). Lets a single fleet
+  // mix bots running under different Claude config profiles.
+  config_dir?: string;
 };
 
 // Bot working trees live under this directory. create-bot mkdirs
@@ -100,7 +104,20 @@ mkdirSync(LOG_DIR, { recursive: true });
 
 const SHARED_MCP_CONFIG = join(import.meta.dir, 'shared-mcp.json');
 const PTY_HELPER = join(import.meta.dir, 'scripts', 'pty-helper.py');
-const CLAUDE_CONFIG_DIR_DEFAULT = process.env.CLAUDE_CONFIG_DIR ?? join(process.env.HOME ?? '', '.claude-sfc');
+
+// Resolve which Claude config dir a bot runs under. Precedence:
+//   1. Per-bot override (Bot.config_dir, settable via `create --config` /
+//      `update --config`).
+//   2. Dispatcher-wide override from the CLAUDE_CONFIG_DIR env var.
+//   3. Repo default: ~/.claude (the standard Claude Code location).
+// Operators with a non-default profile (e.g. ~/.claude-sfc, ~/.claude-mimo)
+// just launch the dispatcher with CLAUDE_CONFIG_DIR set in their shell or
+// .env and the whole fleet inherits it.
+const GLOBAL_CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR ?? join(process.env.HOME ?? '', '.claude');
+
+function configDirFor(bot: Bot): string {
+  return bot.config_dir ?? GLOBAL_CONFIG_DIR;
+}
 
 // ---------- Logging ----------
 
@@ -280,12 +297,23 @@ async function spawnBot(bot: Bot, trigger: WakeTrigger): Promise<void> {
     '--mcp-config', SHARED_MCP_CONFIG,
   );
 
+  const botConfigDir = configDirFor(bot);
+  // Pretrust the working tree under whichever config dir we're about to
+  // spawn into. Idempotent — safe to call every spawn — and ensures the
+  // workspace-trust dialog never appears even if config_dir changed since
+  // create-time.
+  try {
+    pretrustDirectory(bot.cwd, botConfigDir);
+  } catch (err: any) {
+    log(`@${bot.name}: pre-trust failed (non-fatal): ${err.message}`);
+  }
+
   const child = Bun.spawn({
     cmd,
     cwd: bot.cwd,
     env: {
       ...process.env,
-      CLAUDE_CONFIG_DIR: CLAUDE_CONFIG_DIR_DEFAULT,
+      CLAUDE_CONFIG_DIR: botConfigDir,
       // Inject this bot's own creds — channel server reads ZULIP_BOT_EMAIL /
       // ZULIP_API_KEY / ZULIP_HOME_STREAM and would otherwise inherit
       // dispatch-bot's creds from process.env.
@@ -332,7 +360,7 @@ async function spawnBot(bot: Bot, trigger: WakeTrigger): Promise<void> {
     // Capture the session_id of the just-ended session so the next wake can
     // --resume it. Picks the newest jsonl in the bot's CLAUDE_CONFIG_DIR
     // project directory.
-    const sid = latestSessionId(CLAUDE_CONFIG_DIR_DEFAULT, bot.cwd);
+    const sid = latestSessionId(botConfigDir, bot.cwd);
     if (sid) {
       const state = readState(bot.name);
       state.session_id = sid;
@@ -665,7 +693,8 @@ async function handleDispatchCommand(msg: any): Promise<void> {
     case 'spinUp':     return cmdSpinUp(topic, cmd.target);
     case 'shutDown':   return cmdShutDown(topic, cmd.target);
     case 'reset':      return cmdReset(topic, cmd.target);
-    case 'createBot':  return cmdCreateBot(topic, cmd.target);
+    case 'create':     return cmdCreate(topic, cmd.target, cmd.configDir);
+    case 'update':     return cmdUpdate(topic, cmd.target, cmd);
     case 'retire':     return cmdRetire(topic, cmd.target);
     case 'listActive': return cmdListActive(topic);
     case 'status':     return cmdStatus(topic, cmd.target);
@@ -746,7 +775,7 @@ async function cmdReset(topic: string, name: string): Promise<void> {
 // Provision a new bot end-to-end. Bot creation goes through the owner's
 // credentials because Zulip's /bots endpoint rejects bot callers; everything
 // else uses dispatch-bot.
-async function cmdCreateBot(topic: string, name: string): Promise<void> {
+async function cmdCreate(topic: string, name: string, configDir?: string): Promise<void> {
   if (!/^[a-z][a-z0-9_-]*$/.test(name)) {
     return postToDispatch(topic, `invalid name \`${name}\` — must start with a lowercase letter and contain only [a-z0-9_-]`);
   }
@@ -823,44 +852,87 @@ async function cmdCreateBot(topic: string, name: string): Promise<void> {
     return postToDispatch(topic, `stream OK but working tree scaffold failed: ${err.message}`);
   }
 
-  // Step 3.5: pre-mark the directory as trusted in CLAUDE_CONFIG_DIR/.claude.json.
-  // Without this, the spawned Claude shows a workspace-trust dialog at startup
-  // ("Is this a project you created or trust?") in addition to the
-  // --dangerously-load-development-channels warning. Our auto-Enter only fires
-  // once, so the channels dialog ends up un-dismissed and the bot hangs.
-  try {
-    pretrustDirectory(cwd);
-    log(`@${name}: pre-trusted ${cwd}`);
-  } catch (err: any) {
-    log(`@${name}: pre-trust failed (non-fatal — first spawn may show trust dialog): ${err.message}`);
-  }
+  // Pretrust happens at spawn time now (see spawnBot), so we don't repeat
+  // it here — the working tree won't be entered by Claude until first wake.
 
   // Step 4: register and persist.
-  REGISTRY[name] = {
+  const entry: Bot = {
     name,
     home_stream: name,
     cwd,
     bot_email: botUser.email,
     bot_api_key: botUser.api_key,
   };
+  if (configDir) entry.config_dir = configDir;
+  REGISTRY[name] = entry;
   saveRegistry(REGISTRY);
 
+  const lines = [
+    `✓ @${name} created`,
+    `- bot user: \`${botUser.email}\` (user_id ${botUser.user_id})`,
+    `- home stream: \`#${name}\``,
+    `- working tree: \`${cwd}\``,
+  ];
+  if (configDir) lines.push(`- config dir: \`${configDir}\` (per-bot override)`);
+  lines.push(`Run \`spin up ${name}\` and tell it what kind of bot to be.`);
+  await postToDispatch(topic, lines.join('\n'));
+}
+
+// Mutate a bot's registry entry. Today only --config / --clear-config are
+// wired; the command shape supports adding more per-bot fields later. Changes
+// take effect on next spawn — running bots keep their old config until reset.
+async function cmdUpdate(
+  topic: string,
+  name: string,
+  opts: { configDir?: string; clearConfig?: boolean },
+): Promise<void> {
+  const bot = REGISTRY[name];
+  if (!bot) return postToDispatch(topic, `no bot named \`${name}\` in registry`);
+
+  // No flags → show current config-dir for this bot.
+  if (!opts.configDir && !opts.clearConfig) {
+    const effective = configDirFor(bot);
+    const overridden = bot.config_dir ? ' (per-bot override)' : ' (global default)';
+    return postToDispatch(
+      topic,
+      `@${name} config dir: \`${effective}\`${overridden}`,
+    );
+  }
+
+  if (opts.configDir && opts.clearConfig) {
+    return postToDispatch(topic, `\`--config\` and \`--clear-config\` are mutually exclusive`);
+  }
+
+  if (opts.clearConfig) {
+    delete bot.config_dir;
+  } else if (opts.configDir) {
+    bot.config_dir = opts.configDir;
+  }
+  saveRegistry(REGISTRY);
+
+  // Session jsonls live under the OLD config dir, so a `--resume <sid>` from
+  // the new dir would fail. Clear stored session_id so next spawn starts
+  // fresh. The bot's CLAUDE.md and HANDOFF.md (in cwd) still survive, so
+  // identity isn't lost — only the conversation history.
+  const state = readState(name);
+  state.session_id = null;
+  writeState(state);
+
+  const effective = configDirFor(bot);
+  const note = isAlive(name)
+    ? ` running session keeps the old config until you \`reset ${name}\` or it dies.`
+    : '';
   await postToDispatch(
     topic,
-    [
-      `✓ @${name} created`,
-      `- bot user: \`${botUser.email}\` (user_id ${botUser.user_id})`,
-      `- home stream: \`#${name}\``,
-      `- working tree: \`${cwd}\` — \`spin up ${name}\` and tell it what kind of bot to be`,
-    ].join('\n'),
+    `@${name} config dir → \`${effective}\`. Session cleared (next start is fresh).${note}`,
   );
 }
 
-// Mark `cwd` as trusted in CLAUDE_CONFIG_DIR/.claude.json so the workspace-trust
+// Mark `cwd` as trusted in <configDir>/.claude.json so the workspace-trust
 // dialog doesn't appear on first spawn. Read-modify-atomic-rename to minimize
 // races with other Claude processes that update the same file.
-function pretrustDirectory(cwd: string): void {
-  const path = join(CLAUDE_CONFIG_DIR_DEFAULT, '.claude.json');
+function pretrustDirectory(cwd: string, configDir: string): void {
+  const path = join(configDir, '.claude.json');
   let data: any = {};
   if (existsSync(path)) {
     try {
@@ -1064,20 +1136,27 @@ async function cmdLogs(topic: string, name: string, n: number): Promise<void> {
 }
 
 async function cmdHelp(topic: string): Promise<void> {
+  // Each row pairs the canonical form with its aliases (parseCommand accepts
+  // any of them). Kept in sync with lib/commands.ts ALIASES manually.
+  const rows: Array<[string, string, string?]> = [
+    ['spin up @<bot>', 'start that bot (resumes prior session if known)', 'wake, wake up, start'],
+    ['shut down @<bot>', 'kill that bot (next start will resume)', 'stop, kill'],
+    ['reset @<bot>', 'kill and clear stored session; next start is fresh'],
+    ['create <name> [--config <path>]', 'provision a new bot end-to-end', 'create-bot'],
+    ['update <name> [--config <path> | --clear-config]', 'change a bot\'s per-bot settings (clears session so changes take effect)'],
+    ['retire <name>', 'kill, deactivate Zulip bot, archive stream, remove from registry'],
+    ['list active', 'running bots + uptime', 'list'],
+    ['status [@<bot>]', 'alive/sleeping + last activity (all bots if no name)'],
+    ['logs @<bot> [n]', 'last n lines of bot stdout/stderr (default 30)', 'log'],
+    ['help', 'this'],
+  ];
+  const body = rows.map(([cmd, desc, aliases]) => {
+    const tail = aliases ? ` _(aliases: ${aliases})_` : '';
+    return `- \`${cmd}\` — ${desc}${tail}`;
+  });
   await postToDispatch(
     topic,
-    [
-      '**Fleet-ops commands** (post in #' + DISPATCH_STREAM + '):',
-      '- `spin up @<bot>` — start that bot (resumes prior session if known)',
-      '- `shut down @<bot>` — kill that bot (next start will resume)',
-      '- `reset @<bot>` — kill and clear stored session; next start is fresh',
-      '- `create-bot <name>` — provision a new bot end-to-end (Zulip user via owner creds, stream, working tree, registry)',
-      '- `retire <name>` — kill, deactivate Zulip bot, archive stream, remove from registry',
-      '- `list active` — running bots + uptime',
-      '- `status [@<bot>]` — alive/sleeping + last activity (all bots if no name)',
-      '- `logs @<bot> [n]` — last n lines of bot stdout/stderr (default 30)',
-      '- `help` — this',
-    ].join('\n'),
+    ['**Fleet-ops commands** (post in #' + DISPATCH_STREAM + '):', ...body].join('\n'),
   );
 }
 

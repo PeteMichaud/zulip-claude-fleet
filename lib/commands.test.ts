@@ -23,13 +23,52 @@ describe('parseCommand', () => {
     expect(parseCommand('Reset briefing')).toEqual({ kind: 'reset', target: 'briefing' });
   });
 
-  test('create-bot (variants)', () => {
-    expect(parseCommand('create-bot writer')).toEqual({ kind: 'createBot', target: 'writer' });
-    expect(parseCommand('create bot writer')).toEqual({ kind: 'createBot', target: 'writer' });
-    expect(parseCommand('createbot writer')).toEqual({ kind: 'createBot', target: 'writer' });
-    expect(parseCommand('CREATE-BOT writer')).toEqual({ kind: 'createBot', target: 'writer' });
-    expect(parseCommand('create-bot @writer')).toEqual({ kind: 'createBot', target: 'writer' });
-    expect(parseCommand('create-bot test-bot-1')).toEqual({ kind: 'createBot', target: 'test-bot-1' });
+  test('create (variants, includes legacy create-bot alias)', () => {
+    expect(parseCommand('create writer')).toEqual({ kind: 'create', target: 'writer' });
+    expect(parseCommand('create-bot writer')).toEqual({ kind: 'create', target: 'writer' });
+    expect(parseCommand('create bot writer')).toEqual({ kind: 'create', target: 'writer' });
+    expect(parseCommand('createbot writer')).toEqual({ kind: 'create', target: 'writer' });
+    expect(parseCommand('CREATE-BOT writer')).toEqual({ kind: 'create', target: 'writer' });
+    expect(parseCommand('create @writer')).toEqual({ kind: 'create', target: 'writer' });
+    expect(parseCommand('create test-bot-1')).toEqual({ kind: 'create', target: 'test-bot-1' });
+  });
+
+  test('create with --config flag', () => {
+    expect(parseCommand('create writer --config ~/.claude-mimo')).toEqual({
+      kind: 'create',
+      target: 'writer',
+      configDir: '~/.claude-mimo',
+    });
+    expect(parseCommand('create writer --config=~/.claude-mimo')).toEqual({
+      kind: 'create',
+      target: 'writer',
+      configDir: '~/.claude-mimo',
+    });
+    // Order shouldn't matter — flag before positional should parse the same.
+    expect(parseCommand('create --config ~/.claude-mimo writer')).toEqual({
+      kind: 'create',
+      target: 'writer',
+      configDir: '~/.claude-mimo',
+    });
+  });
+
+  test('update with --config / --clear-config', () => {
+    expect(parseCommand('update writer --config ~/.claude-mimo')).toEqual({
+      kind: 'update',
+      target: 'writer',
+      configDir: '~/.claude-mimo',
+    });
+    expect(parseCommand('update writer --clear-config')).toEqual({
+      kind: 'update',
+      target: 'writer',
+      clearConfig: true,
+    });
+    expect(parseCommand('update writer')).toEqual({ kind: 'update', target: 'writer' });
+    expect(parseCommand('update @writer --config /abs/path')).toEqual({
+      kind: 'update',
+      target: 'writer',
+      configDir: '/abs/path',
+    });
   });
 
   test('retire', () => {
