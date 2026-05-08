@@ -417,16 +417,21 @@ async function handleMessage(event: any) {
   const issuingBot = isOwner ? undefined : botFromSender(senderEmail);
   if (!isOwner && !issuingBot) return; // unknown sender — ignore
 
+  // Bump activity timestamps. Owner messages count as activity for the
+  // home bot (the addressee). Bot-self posts count as activity for that
+  // bot (it's working — don't auto-idle-shut while it's mid-reply).
+  if (isOwner) {
+    bumpActivity(homeBot.name);
+  } else if (issuingBot) {
+    bumpActivity(issuingBot.name);
+  }
+
   // Wake-up logic: only the operator's messages summon a sleeping bot. A
   // registered bot posting in its own stream is already alive (or will be
   // mediated by @-mention forwarding below if it's mentioning someone else).
   if (isOwner) {
     const snippet = (msg.content ?? '').slice(0, 100).replace(/\n/g, ' ');
     log(`inbound for @${homeBot.name}: topic="${msg.subject ?? ''}" sender="${msg.sender_full_name ?? ''}" content=${JSON.stringify(snippet)}`);
-
-    const state = readState(homeBot.name);
-    state.last_active = new Date().toISOString();
-    writeState(state);
 
     if (!isAlive(homeBot.name)) {
       const trigger: WakeTrigger = {
@@ -530,6 +535,7 @@ async function forwardMention(target: Bot, originalMsg: any, originStream: strin
     `If you reply, post to #${originStream} via \`send(stream="${originStream}", topic="${originTopic}", text=...)\`.`,
   ].join('\n');
 
+  bumpActivity(target.name); // a freshly-summoned bot shouldn't be auto-idled
   if (isAlive(target.name)) {
     log(`forwarding mention to @${target.name} (alive) via #${target.home_stream}`);
     await zulip('/messages', {
@@ -550,6 +556,63 @@ async function forwardMention(target: Bot, originalMsg: any, originStream: strin
       content: forwarded,
     };
     await maybeSpawn(target, trigger);
+  }
+}
+
+// ---------- Activity tracking + idle shutdown ----------
+
+function bumpActivity(botName: string): void {
+  const state = readState(botName);
+  state.last_active = new Date().toISOString();
+  writeState(state);
+}
+
+const IDLE_TIMEOUT_MS = parseInt(
+  process.env.BOT_IDLE_TIMEOUT_MS ?? String(30 * 60 * 1000),
+  10,
+);
+const IDLE_CHECK_INTERVAL_MS = 60_000; // walk runningBots once a minute
+
+async function checkIdleBots(): Promise<void> {
+  const now = Date.now();
+  for (const [name] of runningBots) {
+    const state = readState(name);
+    if (!state.last_active) continue;
+    const lastMs = Date.parse(state.last_active);
+    if (Number.isNaN(lastMs)) continue;
+    const idleMs = now - lastMs;
+    if (idleMs >= IDLE_TIMEOUT_MS) {
+      await idleShutdown(name, idleMs).catch((err: any) =>
+        log(`idle shutdown of @${name} failed: ${err.message}`),
+      );
+    }
+  }
+}
+
+async function idleShutdown(name: string, idleMs: number): Promise<void> {
+  const bot = REGISTRY[name];
+  const child = runningBots.get(name);
+  if (!bot || !child) return;
+
+  log(`@${name}: idle for ${humanDuration(idleMs)} — auto-sleeping`);
+
+  // Post a notice into the bot's home stream first, so the operator sees
+  // why their session went away. Topic "lifecycle" so the system messages
+  // don't pollute whatever conversation topic is active.
+  await zulip('/messages', {
+    method: 'POST',
+    params: {
+      type: 'stream',
+      to: bot.home_stream,
+      topic: 'lifecycle',
+      content: `💤 Auto-sleeping @${name} after ${humanDuration(idleMs)} idle. Send any message in this stream to wake again.`,
+    },
+  }).catch((err: any) => log(`@${name}: idle notice post failed: ${err.message}`));
+
+  try {
+    child.kill('SIGTERM');
+  } catch (err: any) {
+    log(`@${name}: idle SIGTERM failed: ${err.message}`);
   }
 }
 
@@ -1033,6 +1096,7 @@ const shutdown = (sig: string) => {
   log(`received ${sig}, shutting down`);
   running = false;
   pollAbort.abort(); // cancels the in-flight long-poll so the loop exits promptly
+  clearInterval(idleTimer);
   for (const [name, child] of runningBots) {
     log(`terminating @${name} (pid ${child.pid})`);
     try { child.kill('SIGTERM'); } catch { /* already gone */ }
@@ -1040,6 +1104,14 @@ const shutdown = (sig: string) => {
 };
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
+
+// Periodic sweep for idle bots. Default threshold 30 minutes (overridable
+// via BOT_IDLE_TIMEOUT_MS env var). Cleared in shutdown handler.
+const idleTimer = setInterval(() => {
+  if (!running) return;
+  checkIdleBots().catch((err: any) => log(`idle sweep failed: ${err.message}`));
+}, IDLE_CHECK_INTERVAL_MS);
+log(`idle shutdown enabled: ${humanDuration(IDLE_TIMEOUT_MS)} threshold, sweep every ${humanDuration(IDLE_CHECK_INTERVAL_MS)}`);
 
 while (running) {
   try {

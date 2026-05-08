@@ -67,7 +67,7 @@ Test coverage and known gaps: [TESTING.md](TESTING.md).
 
 ## Status
 
-End-to-end working: JIT spawn (bot wakes when you message it), lifecycle commands (`spin up` / `shut down` / `reset` / `status` / `logs` / `list active`), persistent conversation continuity via `claude --resume` so context survives sleep/wake, fully automated `create-bot` / `retire`, permission relay with emoji reactions and a danger-pattern carve-out for things like `rm -rf`, and inter-bot @-mention relay — `@editor` in `#writer` summons editor (waking it if asleep) and editor's reply lands back in `#writer` without subscribing every bot to every stream.
+End-to-end working: JIT spawn (bot wakes when you message it), lifecycle commands (`spin up` / `shut down` / `reset` / `status` / `logs` / `list active`), persistent conversation continuity via `claude --resume` so context survives sleep/wake, fully automated `create-bot` / `retire`, permission relay with emoji reactions and a danger-pattern carve-out for things like `rm -rf`, inter-bot @-mention relay (`@editor` in `#writer` summons editor and reply lands back in `#writer` without subscribing every bot to every stream), and idle auto-shutdown after 30 minutes of inactivity.
 
 48 unit tests cover the pure helpers (command parsing, formatting, permission logic, Zulip client). Integration paths (process supervision, MCP wiring, real Zulip behavior) are manually verified by running through the quickstart above — see TESTING.md for what's covered vs. deferred.
 
@@ -77,7 +77,6 @@ End-to-end working: JIT spawn (bot wakes when you message it), lifecycle command
 - **Smarter dispatcher.** The dispatcher's command grammar is hand-coded regex. A meta-Claude *inside* `@dispatch-bot` could interpret natural-language requests ("spin up a Python expert that handles refactoring questions, name it pyrefactor") and translate them into structured calls. Removes the need to extend the parser for every new operation.
 - **Handoff on shutdown.** `shut down` and `compact` don't auto-invoke the `/handoff` skill to capture tacit state — `--resume` carries conversation history but not the latent stuff (working hypotheses, ruled-out approaches, "what was I about to do"). Brittle to implement (the dispatcher has to instruct Claude to write the file, then wait for completion or timeout, then kill); deferred for now.
 - **Smarter inter-bot loop handling.** The basic @-mention relay ships with a crude rate limit (10 forwards/60s per target) — enough to bound runaway loops but heavy-handed. A real solution tracks mention-chain depth or per-conversation forward graphs.
-- **Idle shutdown.** Currently bots live until explicit `shut down` or dispatcher restart. A wall-clock-or-tool-activity threshold would auto-park sleeping bots to free token budget.
 - **Plugin packaging.** Get the channel server onto Anthropic's `--channels` allowlist so the dispatcher doesn't need `--dangerously-load-development-channels`.
 
 ## Why this exists
