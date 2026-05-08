@@ -22,6 +22,7 @@ import { isDangerousToolCall, PERMISSION_REPLY_RE } from './lib/permission.ts';
 import { makeHeartbeat } from './lib/heartbeat.ts';
 import { startJsonlActivityWatcher } from './lib/jsonl-tail.ts';
 import { appendAllowEntry, derivePattern, matchesAllow } from './lib/allowlist.ts';
+import { fetchMessagesSince } from './lib/zulip-catchup.ts';
 
 // ---------- Debug log ----------
 // stderr from MCP servers goes somewhere we can't easily find;
@@ -491,6 +492,11 @@ async function replayWakeTriggerIfPresent() {
 // ---------- Zulip event queue ----------
 let queueId: string | undefined;
 let lastEventId = -1;
+// Bookmark of the highest msg.id we've successfully handed off to Claude.
+// Distinct from lastEventId (queue events live in a different namespace and
+// die with the queue). Used by the catch-up fetch on re-register to recover
+// owner messages that arrived during the gap.
+let lastHandledMessageId = 0;
 
 async function registerQueue() {
   const data = await zulip('/register', {
@@ -584,6 +590,42 @@ const shutdown = () => {
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
 
+async function dispatchMessageEvent(event: any): Promise<void> {
+  await handleMessage(event);
+  const msgId = event?.message?.id;
+  if (typeof msgId === 'number' && msgId > lastHandledMessageId) {
+    lastHandledMessageId = msgId;
+  }
+}
+
+// After re-registering (queue death), fetch any messages that arrived in the
+// gap and replay them through handleMessage. Reactions buffered on the dying
+// queue are gone — they're ephemeral signal anyway. Bookmark advances inside
+// dispatchMessageEvent so successive re-registers don't re-replay.
+async function catchUpMissedMessages(): Promise<void> {
+  if (lastHandledMessageId === 0) return;
+  let missed: any[];
+  try {
+    missed = await fetchMessagesSince({
+      zulip,
+      sinceMessageId: lastHandledMessageId,
+      narrow: [['stream', HOME_STREAM]],
+    });
+  } catch (err: any) {
+    debug(`catch-up fetch failed (proceeding without): ${err.message}`);
+    return;
+  }
+  if (missed.length === 0) return;
+  debug(`replaying ${missed.length} missed messages since msg ${lastHandledMessageId}`);
+  for (const message of missed) {
+    try {
+      await dispatchMessageEvent({ message });
+    } catch (err: any) {
+      debug(`catch-up replay error on msg ${message.id}: ${err.message}`);
+    }
+  }
+}
+
 while (running) {
   try {
     const data = await zulip('/events', {
@@ -592,7 +634,7 @@ while (running) {
     for (const event of data.events) {
       lastEventId = Math.max(lastEventId, event.id);
       try {
-        if (event.type === 'message') await handleMessage(event);
+        if (event.type === 'message') await dispatchMessageEvent(event);
         else if (event.type === 'reaction') await handleReaction(event);
       } catch (err: any) {
         console.error('event handler error:', err.message);
@@ -601,7 +643,7 @@ while (running) {
   } catch (err: any) {
     if (String(err.message).includes('BAD_EVENT_QUEUE_ID')) {
       console.error('zulip-channel: event queue expired, re-registering');
-      await registerQueue().catch((e) => {
+      await registerQueue().then(catchUpMissedMessages).catch((e) => {
         console.error('zulip-channel: re-register failed, retrying in 5s:', e.message);
         return new Promise((r) => setTimeout(r, 5000));
       });
