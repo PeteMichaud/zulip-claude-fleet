@@ -119,10 +119,11 @@ const zulip = makeZulipClient({
   apiKey: DISPATCH_BOT_API_KEY,
 });
 
-// `zulipAsOwner` is the owner's (Pete's) identity. Needed only for endpoints
-// that explicitly reject bot callers — namely `/bots` for creating new bot
-// users. Optional at startup; if OWNER_API_KEY isn't in .env, create-bot
-// fails at command time with a clear message rather than blocking startup.
+// `zulipAsOwner` is the owner's (real-user) identity. Needed only for
+// endpoints that explicitly reject bot callers — namely `/bots` for creating
+// new bot users. Optional at startup; if OWNER_API_KEY isn't in .env,
+// create-bot fails at command time with a clear message rather than blocking
+// startup.
 const OWNER_EMAIL = process.env.OWNER_EMAIL;
 const OWNER_API_KEY = process.env.OWNER_API_KEY;
 const zulipAsOwner = OWNER_EMAIL && OWNER_API_KEY
@@ -574,7 +575,7 @@ async function cmdCreateBot(topic: string, name: string): Promise<void> {
   await postToDispatch(topic, `creating @${name}…`);
 
   // Step 1: create the bot user via the owner's account. /bots rejects
-  // bot callers, so we use Pete's user creds for this one call only.
+  // bot callers, so we use the owner's user creds for this one call only.
   let botUser: { user_id: number; email: string; api_key: string };
   try {
     const created = await zulipAsOwner('/bots', {
@@ -695,27 +696,27 @@ function pretrustDirectory(cwd: string): void {
 function claudeMdStub(name: string): string {
   return `# ${name}-bot
 
-You are a Claude session reachable via the Zulip stream \`#${name}\`. Your operator is Pete.
+You are a Claude session reachable via the Zulip stream \`#${name}\`. Your operator is whoever runs this fleet's dispatcher.
 
-This file is the **stub** that the dispatcher wrote when it provisioned you. Pete is going to tell you what kind of bot you should be — your role, scope, conventions, what tools to use freely, what to ask permission for. When he does, edit this file (the \`## Your scope\` section especially) so the new persona persists across sessions. After you've made the edit, ask the dispatcher to reset you so the next session starts with the new identity:
+This file is the **stub** that the dispatcher wrote when it provisioned you. Your operator is going to tell you what kind of bot you should be — your role, scope, conventions, what tools to use freely, what to ask permission for. When they do, edit this file (the \`## Your scope\` section especially) so the new persona persists across sessions. After you've made the edit, ask the dispatcher to reset you so the next session starts with the new identity:
 
 \`\`\`
 send(stream="Dispatch", text="reset ${name}")
 \`\`\`
 
-The dispatcher will kill this session, clear your stored conversation, and the next time Pete writes to you, you'll wake up fresh with the new CLAUDE.md as your identity.
+The dispatcher will kill this session, clear your stored conversation, and the next time your operator writes to you, you'll wake up fresh with the new CLAUDE.md as your identity.
 
 ## How you're wired up
 
-- Messages from Pete arrive as \`<channel source="zulip-channel" stream="${name}" topic="..." sender="...">\` events.
+- Messages from your operator arrive as \`<channel source="zulip-channel" stream="${name}" topic="..." sender="...">\` events.
 - You reply by calling the \`send\` tool. Default destination is the same stream and topic as the inbound message.
 - You can read history from any stream you have access to via the \`read\` tool.
-- Tool calls that need permission (Bash, Write, Edit) are relayed to Zulip; Pete taps a ✅ reaction or replies \`yes <id>\`.
-- You can post in \`#Dispatch\` to issue self-targeted lifecycle commands: \`reset ${name}\` (above) or \`shut down ${name}\` (just sleep, will resume when Pete writes to you next).
+- Tool calls that need permission (Bash, Write, Edit) are relayed to Zulip; your operator taps a ✅ reaction or replies \`yes <id>\`.
+- You can post in \`#Dispatch\` to issue self-targeted lifecycle commands: \`reset ${name}\` (above) or \`shut down ${name}\` (just sleep, will resume when your operator writes to you next).
 
 ## Your scope
 
-*(Pete to fill in — this is a placeholder.)*
+*(Operator to fill in — this is a placeholder.)*
 
 - This bot is for:
 - Conventions / preferences:
@@ -732,8 +733,8 @@ The dispatcher will kill this session, clear your stored conversation, and the n
 }
 
 // Retire a bot: kill if running, deactivate the Zulip bot user, archive the
-// stream, remove from registry. Working tree on disk is preserved (Pete can
-// rm -rf manually if he wants — by default we keep history).
+// stream, remove from registry. Working tree is moved into _retired/ so the
+// main fleet dir stays uncluttered (manual unretire = mv it back).
 async function cmdRetire(topic: string, name: string): Promise<void> {
   const bot = REGISTRY[name];
   if (!bot) return postToDispatch(topic, `no bot named \`${name}\` in registry`);
