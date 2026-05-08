@@ -52,6 +52,45 @@ describe('parseCommand', () => {
     });
   });
 
+  test('create with --auto / --yolo enables permission bypass modes', () => {
+    expect(parseCommand('create writer --auto')).toEqual({
+      kind: 'create', target: 'writer', auto: true,
+    });
+    expect(parseCommand('create writer --yolo')).toEqual({
+      kind: 'create', target: 'writer', yolo: true,
+    });
+    expect(parseCommand('create writer --auto --yolo')).toEqual({
+      kind: 'create', target: 'writer', auto: true, yolo: true,
+    });
+    // Combined with other flags
+    expect(parseCommand('create writer --auto --no-spin --config ~/.claude-mimo')).toEqual({
+      kind: 'create', target: 'writer', configDir: '~/.claude-mimo', noSpin: true, auto: true,
+    });
+  });
+
+  test('update with --auto / --no-auto / --yolo / --no-yolo (tri-state)', () => {
+    // Set true
+    expect(parseCommand('update writer --auto')).toEqual({
+      kind: 'update', target: 'writer', auto: true,
+    });
+    // Explicit false
+    expect(parseCommand('update writer --no-auto')).toEqual({
+      kind: 'update', target: 'writer', auto: false,
+    });
+    expect(parseCommand('update writer --yolo')).toEqual({
+      kind: 'update', target: 'writer', yolo: true,
+    });
+    expect(parseCommand('update writer --no-yolo')).toEqual({
+      kind: 'update', target: 'writer', yolo: false,
+    });
+    // Bare update with no flags: no auto/yolo fields (preserves current values).
+    expect(parseCommand('update writer')).toEqual({ kind: 'update', target: 'writer' });
+    // Combined with config
+    expect(parseCommand('update writer --auto --config ~/.claude-mimo')).toEqual({
+      kind: 'update', target: 'writer', configDir: '~/.claude-mimo', auto: true,
+    });
+  });
+
   test('create with --no-spin opts out of auto spin-up', () => {
     expect(parseCommand('create writer --no-spin')).toEqual({
       kind: 'create',

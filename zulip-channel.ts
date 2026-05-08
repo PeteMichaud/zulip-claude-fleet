@@ -198,6 +198,15 @@ const SETTINGS_LOCAL_PATH = '.claude/settings.local.json';
 // and auto-emit allow if any pattern matches. Effective immediately, no reload.
 const runtimeAllowlist = new Set<string>();
 
+// Auto mode: dispatcher sets ZULIP_AUTO_APPROVE=1 for bots created/updated
+// with --auto. Short-circuits every non-danger permission prompt to allow,
+// without ever posting to Zulip. Danger filter still applies — auto mode
+// never silently allows `rm -rf`, force-push, sudo, etc. (For full bypass
+// including danger, --yolo passes --dangerously-skip-permissions to claude
+// at spawn time, in which case the prompt never reaches us.)
+const AUTO_APPROVE = process.env.ZULIP_AUTO_APPROVE === '1';
+if (AUTO_APPROVE) debug('auto mode: ZULIP_AUTO_APPROVE=1 — non-danger prompts auto-allowed');
+
 const PermissionRequestSchema = z.object({
   method: z.literal('notifications/claude/channel/permission_request'),
   params: z.object({
@@ -212,6 +221,17 @@ mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }) => {
   debug('permission_request:', { id: params.request_id, tool: params.tool_name, desc: params.description });
 
   const dangerous = isDangerousToolCall(params.tool_name, params.input_preview);
+
+  // Auto mode short-circuit: every non-danger prompt → allow, no Zulip post.
+  // Checked before the runtime allowlist so we don't waste cycles iterating.
+  if (AUTO_APPROVE && !dangerous) {
+    debug('auto-approve:', { tool: params.tool_name, request_id: params.request_id });
+    await mcp.notification({
+      method: 'notifications/claude/channel/permission',
+      params: { request_id: params.request_id, behavior: 'allow' },
+    });
+    return;
+  }
 
   // Runtime allowlist: if any pattern from a prior ♾️ tap in this session
   // matches, auto-emit allow without bothering the operator. Bypasses the
