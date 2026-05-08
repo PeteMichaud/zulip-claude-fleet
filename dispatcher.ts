@@ -675,37 +675,43 @@ async function postToDispatch(topic: string, content: string): Promise<void> {
   }
 }
 
+// Owner gets full command access; a registered bot is restricted to
+// self-targeted reset/shutdown (so it can request its own restart after
+// self-modification); anyone else is ignored silently.
+type DispatchSender =
+  | { kind: 'owner' }
+  | { kind: 'bot'; bot: Bot }
+  | { kind: 'unknown' };
+
+function classifyDispatchSender(msg: any): DispatchSender {
+  if (msg.sender_id === OWNER_USER_ID) return { kind: 'owner' };
+  const bot = botFromSender(String(msg.sender_email ?? ''));
+  if (bot) return { kind: 'bot', bot };
+  return { kind: 'unknown' };
+}
+
+function botCanIssue(bot: Bot, cmd: Command): boolean {
+  const target = (cmd as { target?: string }).target;
+  return (cmd.kind === 'reset' || cmd.kind === 'shutDown') && target === bot.name;
+}
+
 async function handleDispatchCommand(msg: any): Promise<void> {
-  const text = String(msg.content ?? '').trim();
-  const topic = msg.subject || 'general';
-  const senderEmail = String(msg.sender_email ?? '');
-
   // (handleMessage already filters dispatch-bot's own posts before we get here.)
-
-  // Identify the sender. Owner gets full command access; a registered bot
-  // gets a self-restricted subset (so it can request its own reset/shutdown
-  // after self-modification). Anyone else is ignored silently.
-  const isOwner = msg.sender_id === OWNER_USER_ID;
-  const issuingBot = isOwner ? undefined : botFromSender(senderEmail);
-  if (!isOwner && !issuingBot) {
-    log(`#${DISPATCH_STREAM} message from unknown sender ${senderEmail} — ignored`);
+  const sender = classifyDispatchSender(msg);
+  if (sender.kind === 'unknown') {
+    log(`#${DISPATCH_STREAM} message from unknown sender ${msg.sender_email} — ignored`);
     return;
   }
 
-  log(`dispatch command from ${isOwner ? 'owner' : `@${issuingBot!.name}`}: ${JSON.stringify(text)}`);
+  const text = String(msg.content ?? '').trim();
+  const topic = msg.subject || 'general';
+  log(`dispatch command from ${sender.kind === 'owner' ? 'owner' : `@${sender.bot.name}`}: ${JSON.stringify(text)}`);
 
   const cmd = parseCommand(text);
 
-  // Bot senders are restricted to self-targeted reset / shutDown only.
-  if (issuingBot) {
-    const target = (cmd as { target?: string }).target;
-    const allowed =
-      (cmd.kind === 'reset' || cmd.kind === 'shutDown') &&
-      target === issuingBot.name;
-    if (!allowed) {
-      log(`@${issuingBot.name} unauthorized: ${cmd.kind} ${target ?? ''} — ignored`);
-      return;
-    }
+  if (sender.kind === 'bot' && !botCanIssue(sender.bot, cmd)) {
+    log(`@${sender.bot.name} unauthorized: ${cmd.kind} ${(cmd as { target?: string }).target ?? ''} — ignored`);
+    return;
   }
   if (cmd.kind !== 'unknown') return executeCommand(cmd, topic);
 
@@ -822,6 +828,51 @@ async function cmdReset(topic: string, name: string): Promise<void> {
 // Provision a new bot end-to-end. Bot creation goes through the owner's
 // credentials because Zulip's /bots endpoint rejects bot callers; everything
 // else uses dispatch-bot.
+// /bots rejects bot callers, so this single call uses the owner's user creds.
+// /bots response shape varies across Zulip versions (some omit `email`), so we
+// look it up via /users/{id} for the authoritative record.
+async function provisionBotUser(name: string): Promise<{ user_id: number; email: string; api_key: string }> {
+  if (!zulipAsOwner) {
+    throw new Error('OWNER_API_KEY not configured. Add OWNER_EMAIL and OWNER_API_KEY to .env.');
+  }
+  // Zulip auto-appends `-bot@<realm>` to short_name; passing `<name>-bot`
+  // produces `<name>-bot-bot@…`. Pass the bare name.
+  const created = await zulipAsOwner('/bots', {
+    method: 'POST',
+    params: { full_name: `${name}-bot`, short_name: name, bot_type: 1 },
+  });
+  if (typeof created.user_id !== 'number' || !created.api_key) {
+    throw new Error(`unexpected /bots response: ${JSON.stringify(created)}`);
+  }
+  const userInfo = await zulip(`/users/${created.user_id}`);
+  const email = userInfo.user?.email;
+  if (typeof email !== 'string' || email.length === 0) {
+    throw new Error(`bot created (user_id ${created.user_id}) but /users lookup returned no email`);
+  }
+  return { user_id: created.user_id, email, api_key: created.api_key };
+}
+
+// Zulip auto-subscribes the caller (dispatch-bot, since `zulip` is its client).
+async function provisionHomeStream(name: string, botUserId: number): Promise<void> {
+  await zulip('/users/me/subscriptions', {
+    method: 'POST',
+    params: {
+      subscriptions: [{ name }],
+      principals: [OWNER_USER_ID, botUserId],
+    },
+  });
+}
+
+function scaffoldWorkingTree(name: string, cwd: string): void {
+  mkdirSync(cwd, { recursive: true });
+  mkdirSync(join(cwd, '.claude'), { recursive: true });
+  writeFileSync(join(cwd, 'CLAUDE.md'), claudeMdStub(name));
+  writeFileSync(
+    join(cwd, '.claude', 'settings.local.json'),
+    JSON.stringify({ permissions: { allow: ['mcp__zulip-channel__*'] } }, null, 2) + '\n',
+  );
+}
+
 async function cmdCreate(
   topic: string,
   name: string,
@@ -834,83 +885,37 @@ async function cmdCreate(
   if (REGISTRY[name]) {
     return postToDispatch(topic, `\`${name}\` already in registry; pick a different name or \`retire\` it first`);
   }
-  if (!zulipAsOwner) {
-    return postToDispatch(
-      topic,
-      `OWNER_API_KEY not configured. Add OWNER_EMAIL and OWNER_API_KEY to .env (your personal user creds) so the dispatcher can create bot users on your behalf.`,
-    );
-  }
 
   await postToDispatch(topic, `creating @${name}…`);
 
-  // Step 1: create the bot user via the owner's account. /bots rejects
-  // bot callers, so we use the owner's user creds for this one call only.
   let botUser: { user_id: number; email: string; api_key: string };
   try {
-    const created = await zulipAsOwner('/bots', {
-      method: 'POST',
-      params: {
-        full_name: `${name}-bot`,
-        // Zulip auto-appends `-bot@<realm>` to short_name. Passing `<name>-bot`
-        // here produced `<name>-bot-bot@…`; pass the bare name and let Zulip
-        // synthesize the suffix.
-        short_name: name,
-        bot_type: 1, // generic
-      },
-    });
-    if (typeof created.user_id !== 'number' || !created.api_key) {
-      throw new Error(`unexpected /bots response: ${JSON.stringify(created)}`);
-    }
-    // /bots response in some Zulip versions omits `email`; look it up
-    // explicitly via /users/{id} to get the authoritative record.
-    const userInfo = await zulip(`/users/${created.user_id}`);
-    const email = userInfo.user?.email;
-    if (typeof email !== 'string' || email.length === 0) {
-      throw new Error(`bot created (user_id ${created.user_id}) but /users lookup returned no email`);
-    }
-    botUser = { user_id: created.user_id, email, api_key: created.api_key };
-    log(`@${name}: created bot user (user_id ${botUser.user_id}, email ${botUser.email})`);
+    botUser = await provisionBotUser(name);
   } catch (err: any) {
     return postToDispatch(topic, `failed to create bot user: ${err.message}`);
   }
+  log(`@${name}: created bot user (user_id ${botUser.user_id}, email ${botUser.email})`);
 
-  // Step 2: create the home stream and subscribe owner + new bot. Zulip
-  // auto-subscribes the caller (dispatch-bot here, since `zulip` is its client).
   try {
-    await zulip('/users/me/subscriptions', {
-      method: 'POST',
-      params: {
-        subscriptions: [{ name }],
-        principals: [OWNER_USER_ID, botUser.user_id],
-      },
-    });
-    log(`@${name}: stream #${name} ready, subscribers include owner + new bot + dispatch-bot`);
+    await provisionHomeStream(name, botUser.user_id);
   } catch (err: any) {
     return postToDispatch(
       topic,
       `bot user created but stream creation failed: ${err.message}. orphan bot user_id=${botUser.user_id}, email=${botUser.email} — deactivate manually or call \`retire\` after manually adding it to the registry`,
     );
   }
-
-  // Step 3: scaffold the working tree.
-  const cwd = join(FLEET_ROOT, name);
-  try {
-    mkdirSync(cwd, { recursive: true });
-    mkdirSync(join(cwd, '.claude'), { recursive: true });
-    writeFileSync(join(cwd, 'CLAUDE.md'), claudeMdStub(name));
-    writeFileSync(
-      join(cwd, '.claude', 'settings.local.json'),
-      JSON.stringify({ permissions: { allow: ['mcp__zulip-channel__*'] } }, null, 2) + '\n',
-    );
-    log(`@${name}: scaffolded working tree at ${cwd}`);
-  } catch (err: any) {
-    return postToDispatch(topic, `stream OK but working tree scaffold failed: ${err.message}`);
-  }
+  log(`@${name}: stream #${name} ready, subscribers include owner + new bot + dispatch-bot`);
 
   // Pretrust happens at spawn time now (see spawnBot), so we don't repeat
   // it here — the working tree won't be entered by Claude until first wake.
+  const cwd = join(FLEET_ROOT, name);
+  try {
+    scaffoldWorkingTree(name, cwd);
+  } catch (err: any) {
+    return postToDispatch(topic, `stream OK but working tree scaffold failed: ${err.message}`);
+  }
+  log(`@${name}: scaffolded working tree at ${cwd}`);
 
-  // Step 4: register and persist.
   const entry: Bot = {
     name,
     home_stream: name,
@@ -1073,57 +1078,54 @@ The dispatcher will kill this session, clear your stored conversation, and the n
 `;
 }
 
-// Retire a bot: kill if running, deactivate the Zulip bot user, archive the
-// stream, remove from registry. Working tree is moved into _retired/ so the
-// main fleet dir stays uncluttered (manual unretire = mv it back).
-async function cmdRetire(topic: string, name: string): Promise<void> {
-  const bot = REGISTRY[name];
-  if (!bot) return postToDispatch(topic, `no bot named \`${name}\` in registry`);
+// Retire steps. Each handles its own failure mode: SIGTERM-and-wait for the
+// child, log-and-continue for Zulip API failures, return null on archive
+// failure so the caller can mention "left in place" in the result message.
+// All log under the bot's name for grep-ability.
 
-  await postToDispatch(topic, `retiring @${name}…`);
-
-  // Step 1: kill if running.
+async function killIfRunning(bot: Bot): Promise<void> {
   const child = runningBots.get(bot.name);
-  if (child) {
-    try {
-      child.kill('SIGTERM');
-      await Promise.race([
-        child.exited,
-        new Promise((r) => setTimeout(r, 5000)),
-      ]);
-    } catch (err: any) {
-      log(`@${bot.name} retire: kill failed: ${err.message}`);
-    }
+  if (!child) return;
+  try {
+    child.kill('SIGTERM');
+    await Promise.race([
+      child.exited,
+      new Promise((r) => setTimeout(r, 5000)),
+    ]);
+  } catch (err: any) {
+    log(`@${bot.name} retire: kill failed: ${err.message}`);
   }
+}
 
-  // Step 2: look up the bot's user_id from Zulip. If bot_email is missing
-  // (e.g. broken registry entry from an earlier failed create-bot), we look
-  // up by stream subscribers as a fallback, or skip user deactivation.
-  let userId: number | null = null;
-  if (bot.bot_email) {
-    try {
-      const res = await zulip(`/users/${encodeURIComponent(bot.bot_email)}`);
-      userId = res.user?.user_id ?? null;
-    } catch (err: any) {
-      log(`@${bot.name} retire: couldn't look up user_id: ${err.message}`);
-    }
-  } else {
+// Returns null when bot_email is absent (broken registry from a failed
+// create) or the lookup itself fails — caller skips deactivation.
+async function lookupBotUserId(bot: Bot): Promise<number | null> {
+  if (!bot.bot_email) {
     log(`@${bot.name} retire: bot_email missing from registry — skipping user lookup`);
+    return null;
   }
-
-  // Step 3: deactivate the bot user. Reversible; preserves history.
-  // Zulip's DELETE /users/<id> only handles human users — bots use the
-  // /bots/<id> endpoint instead. dispatch-bot's admin role is sufficient.
-  if (userId !== null) {
-    try {
-      await zulip(`/bots/${userId}`, { method: 'DELETE' });
-      log(`@${bot.name} retire: deactivated bot user_id ${userId}`);
-    } catch (err: any) {
-      log(`@${bot.name} retire: deactivation failed: ${err.message}`);
-    }
+  try {
+    const res = await zulip(`/users/${encodeURIComponent(bot.bot_email)}`);
+    return res.user?.user_id ?? null;
+  } catch (err: any) {
+    log(`@${bot.name} retire: couldn't look up user_id: ${err.message}`);
+    return null;
   }
+}
 
-  // Step 4: archive the stream. Reversible by an admin; messages preserved.
+// Zulip's DELETE /users/<id> only handles human users — bots use /bots/<id>
+// instead. dispatch-bot's admin role is sufficient. Reversible; preserves history.
+async function deactivateBotUser(bot: Bot, userId: number): Promise<void> {
+  try {
+    await zulip(`/bots/${userId}`, { method: 'DELETE' });
+    log(`@${bot.name} retire: deactivated bot user_id ${userId}`);
+  } catch (err: any) {
+    log(`@${bot.name} retire: deactivation failed: ${err.message}`);
+  }
+}
+
+// Archives the stream (reversible by admin; messages preserved).
+async function archiveHomeStream(bot: Bot): Promise<void> {
   try {
     const streams = await zulip('/streams');
     const stream = (streams.streams as any[]).find((s) => s.name === bot.home_stream);
@@ -1134,29 +1136,42 @@ async function cmdRetire(topic: string, name: string): Promise<void> {
   } catch (err: any) {
     log(`@${bot.name} retire: stream archive failed: ${err.message}`);
   }
+}
 
-  // Step 5: remove from registry, persist.
+// Move the working tree under _retired/ so the main fleet dir stays clean.
+// Returns the archived path (or null on failure). Timestamped so re-creating
+// + re-retiring the same name doesn't clobber prior archives.
+function archiveWorkingTree(bot: Bot, name: string): string | null {
+  if (!existsSync(bot.cwd)) return null;
+  try {
+    mkdirSync(RETIRED_ROOT, { recursive: true });
+    // Colons stripped for FS safety: 2026-05-07T20-58-30Z
+    const ts = new Date().toISOString().replace(/:/g, '-').replace(/\.\d+/, '');
+    const archivedPath = join(RETIRED_ROOT, `${ts}_${name}`);
+    renameSync(bot.cwd, archivedPath);
+    log(`@${bot.name} retire: moved working tree to ${archivedPath}`);
+    return archivedPath;
+  } catch (err: any) {
+    log(`@${bot.name} retire: failed to archive working tree: ${err.message}`);
+    return null;
+  }
+}
+
+async function cmdRetire(topic: string, name: string): Promise<void> {
+  const bot = REGISTRY[name];
+  if (!bot) return postToDispatch(topic, `no bot named \`${name}\` in registry`);
+
+  await postToDispatch(topic, `retiring @${name}…`);
+
+  await killIfRunning(bot);
+  const userId = await lookupBotUserId(bot);
+  if (userId !== null) await deactivateBotUser(bot, userId);
+  await archiveHomeStream(bot);
+
   delete REGISTRY[name];
   saveRegistry(REGISTRY);
 
-  // Step 6: move the working tree under _retired/ so the main fleet dir
-  // stays clean. Timestamped so re-creating + re-retiring the same name
-  // doesn't clobber prior archives. Manual un-retire = mv back.
-  let archivedPath: string | null = null;
-  if (existsSync(bot.cwd)) {
-    try {
-      mkdirSync(RETIRED_ROOT, { recursive: true });
-      // ISO timestamp with colons replaced for FS-safety: 2026-05-07T20-58-30Z
-      const ts = new Date().toISOString().replace(/:/g, '-').replace(/\.\d+/, '');
-      archivedPath = join(RETIRED_ROOT, `${ts}_${name}`);
-      renameSync(bot.cwd, archivedPath);
-      log(`@${bot.name} retire: moved working tree to ${archivedPath}`);
-    } catch (err: any) {
-      log(`@${bot.name} retire: failed to archive working tree: ${err.message}`);
-      archivedPath = null;
-    }
-  }
-
+  const archivedPath = archiveWorkingTree(bot, name);
   const archiveLine = archivedPath
     ? `Working tree archived to \`${archivedPath}\` — \`mv\` it back to unretire.`
     : `Working tree at \`${bot.cwd}\` left in place (archive failed; rm or move manually).`;
