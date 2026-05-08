@@ -18,6 +18,14 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { makeZulipClient } from './lib/zulip.ts';
+import {
+  createChannelFolder,
+  findFolderByName,
+  getStreamId,
+  listChannelFolders,
+  setStreamFolder,
+  setStreamPin,
+} from './lib/zulip-admin.ts';
 import { parseCommand } from './lib/commands.ts';
 import { humanDuration } from './lib/format.ts';
 import { isIdle, makeBotStateStore, type BotState } from './lib/state.ts';
@@ -652,6 +660,12 @@ async function handleDispatchCommand(msg: any): Promise<void> {
     case 'listActive': return cmdListActive(topic);
     case 'status':     return cmdStatus(topic, cmd.target);
     case 'logs':       return cmdLogs(topic, cmd.target, cmd.n);
+    case 'pin':        return cmdPin(topic, cmd.target, true);
+    case 'unpin':      return cmdPin(topic, cmd.target, false);
+    case 'createFolder': return cmdCreateFolder(topic, cmd.name, cmd.description);
+    case 'listFolders':  return cmdListFolders(topic);
+    case 'setFolder':    return cmdSetFolder(topic, cmd.stream, cmd.folder);
+    case 'clearFolder':  return cmdClearFolder(topic, cmd.stream);
     case 'help':       return cmdHelp(topic);
     case 'unknown': {
       // Not a command — maybe it's chat that mentions a bot. #Dispatch
@@ -1097,6 +1111,87 @@ async function cmdLogs(topic: string, name: string, n: number): Promise<void> {
   await postToDispatch(topic, `**last ${n} lines of @${bot.name}:**\n\`\`\`\n${stripped.slice(-7000)}\n\`\`\``);
 }
 
+// Pin/unpin uses owner creds because pin_to_top is per-user; we want it
+// pinned in *Pete's* sidebar, not dispatch-bot's.
+async function cmdPin(topic: string, streamName: string, value: boolean): Promise<void> {
+  if (!zulipAsOwner) {
+    return postToDispatch(topic, `OWNER_API_KEY not configured — pin/unpin needs owner creds.`);
+  }
+  try {
+    const id = await getStreamId(zulipAsOwner, streamName);
+    await setStreamPin(zulipAsOwner, id, value);
+    await postToDispatch(topic, `${value ? 'pinned' : 'unpinned'} #${streamName}`);
+  } catch (err: any) {
+    await postToDispatch(topic, `${value ? 'pin' : 'unpin'} failed: ${err.message}`);
+  }
+}
+
+async function cmdCreateFolder(
+  topic: string,
+  name: string,
+  description?: string,
+): Promise<void> {
+  if (!zulipAsOwner) {
+    return postToDispatch(topic, `OWNER_API_KEY not configured — channel-folder ops need owner creds.`);
+  }
+  try {
+    // Idempotency: if a folder by this name already exists, don't double-create.
+    const existing = await findFolderByName(zulipAsOwner, name);
+    if (existing) {
+      return postToDispatch(topic, `folder \`${name}\` already exists (id ${existing.id})`);
+    }
+    const id = await createChannelFolder(zulipAsOwner, name, description);
+    await postToDispatch(topic, `created folder \`${name}\` (id ${id})`);
+  } catch (err: any) {
+    await postToDispatch(topic, `create folder failed: ${err.message}`);
+  }
+}
+
+async function cmdListFolders(topic: string): Promise<void> {
+  if (!zulipAsOwner) {
+    return postToDispatch(topic, `OWNER_API_KEY not configured — channel-folder ops need owner creds.`);
+  }
+  try {
+    const folders = await listChannelFolders(zulipAsOwner);
+    const live = folders.filter((f) => !f.is_archived);
+    if (live.length === 0) return postToDispatch(topic, `no channel folders`);
+    const lines = live.map((f) => `- \`${f.name}\` (id ${f.id})${f.description ? ` — ${f.description}` : ''}`);
+    await postToDispatch(topic, ['**channel folders:**', ...lines].join('\n'));
+  } catch (err: any) {
+    await postToDispatch(topic, `list folders failed: ${err.message}`);
+  }
+}
+
+async function cmdSetFolder(topic: string, streamName: string, folderName: string): Promise<void> {
+  if (!zulipAsOwner) {
+    return postToDispatch(topic, `OWNER_API_KEY not configured — channel-folder ops need owner creds.`);
+  }
+  try {
+    const folder = await findFolderByName(zulipAsOwner, folderName);
+    if (!folder) {
+      return postToDispatch(topic, `no folder named \`${folderName}\` — try \`list folders\` or \`create folder ${folderName}\``);
+    }
+    const streamId = await getStreamId(zulipAsOwner, streamName);
+    await setStreamFolder(zulipAsOwner, streamId, folder.id);
+    await postToDispatch(topic, `moved #${streamName} into folder \`${folder.name}\``);
+  } catch (err: any) {
+    await postToDispatch(topic, `set folder failed: ${err.message}`);
+  }
+}
+
+async function cmdClearFolder(topic: string, streamName: string): Promise<void> {
+  if (!zulipAsOwner) {
+    return postToDispatch(topic, `OWNER_API_KEY not configured — channel-folder ops need owner creds.`);
+  }
+  try {
+    const id = await getStreamId(zulipAsOwner, streamName);
+    await setStreamFolder(zulipAsOwner, id, null);
+    await postToDispatch(topic, `removed #${streamName} from its folder`);
+  } catch (err: any) {
+    await postToDispatch(topic, `clear folder failed: ${err.message}`);
+  }
+}
+
 async function cmdHelp(topic: string): Promise<void> {
   // Each row pairs the canonical form with its aliases (parseCommand accepts
   // any of them). Kept in sync with lib/commands.ts ALIASES manually.
@@ -1110,6 +1205,12 @@ async function cmdHelp(topic: string): Promise<void> {
     ['list active', 'running bots + uptime', 'list'],
     ['status [@<bot>]', 'alive/sleeping + last activity (all bots if no name)'],
     ['logs @<bot> [n]', 'last n lines of bot stdout/stderr (default 30)', 'log'],
+    ['pin <stream>', 'pin the stream to the top of your sidebar'],
+    ['unpin <stream>', 'unpin the stream'],
+    ['create folder <name>', 'create a channel folder', 'create-folder'],
+    ['list folders', 'list channel folders', 'list-folders'],
+    ['set folder <stream> <folder>', 'move a stream into a folder', 'set-folder'],
+    ['clear folder <stream>', 'remove a stream from its folder', 'clear-folder'],
     ['help', 'this'],
   ];
   const body = rows.map(([cmd, desc, aliases]) => {

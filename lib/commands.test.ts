@@ -120,6 +120,42 @@ describe('parseCommand', () => {
     expect(parseCommand('logs briefing 1')).toEqual({ kind: 'logs', target: 'briefing', n: 1 });
   });
 
+  test('pin / unpin', () => {
+    expect(parseCommand('pin briefing')).toEqual({ kind: 'pin', target: 'briefing' });
+    expect(parseCommand('pin zulip-fleet')).toEqual({ kind: 'pin', target: 'zulip-fleet' });
+    expect(parseCommand('unpin briefing')).toEqual({ kind: 'unpin', target: 'briefing' });
+    expect(parseCommand('pin')).toEqual({ kind: 'unknown', text: 'pin' });
+  });
+
+  test('create folder (multi-word + hyphen variants, optional description)', () => {
+    expect(parseCommand('create folder SFC')).toEqual({ kind: 'createFolder', name: 'SFC' });
+    expect(parseCommand('create-folder SFC')).toEqual({ kind: 'createFolder', name: 'SFC' });
+    expect(parseCommand('createfolder Personal')).toEqual({ kind: 'createFolder', name: 'Personal' });
+    expect(parseCommand('create folder SFC --description=work')).toEqual({
+      kind: 'createFolder', name: 'SFC', description: 'work',
+    });
+    expect(parseCommand('create folder')).toEqual({ kind: 'unknown', text: 'create folder' });
+  });
+
+  test('list folders', () => {
+    expect(parseCommand('list folders')).toEqual({ kind: 'listFolders' });
+    expect(parseCommand('list-folders')).toEqual({ kind: 'listFolders' });
+    expect(parseCommand('LIST FOLDERS')).toEqual({ kind: 'listFolders' });
+  });
+
+  test('set folder / clear folder', () => {
+    expect(parseCommand('set folder briefing SFC')).toEqual({
+      kind: 'setFolder', stream: 'briefing', folder: 'SFC',
+    });
+    expect(parseCommand('set-folder zulip-fleet SFC')).toEqual({
+      kind: 'setFolder', stream: 'zulip-fleet', folder: 'SFC',
+    });
+    expect(parseCommand('set folder briefing')).toEqual({ kind: 'unknown', text: 'set folder briefing' });
+    expect(parseCommand('clear folder briefing')).toEqual({ kind: 'clearFolder', stream: 'briefing' });
+    expect(parseCommand('clear-folder zulip-fleet')).toEqual({ kind: 'clearFolder', stream: 'zulip-fleet' });
+    expect(parseCommand('clear folder')).toEqual({ kind: 'unknown', text: 'clear folder' });
+  });
+
   test('help', () => {
     expect(parseCommand('help')).toEqual({ kind: 'help' });
     expect(parseCommand('Help')).toEqual({ kind: 'help' });
