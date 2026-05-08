@@ -6,7 +6,7 @@
 // Spawn and timeout are injected so tests can run the parser without invoking
 // the real CLI.
 
-import type { Command } from './commands.ts';
+import { parseTargetToken, type Command } from './commands.ts';
 
 // nlDispatch never returns `unknown` — that's an input-side parse failure.
 // Failure here is signaled via `null`.
@@ -150,19 +150,13 @@ function extractJson(s: string): string | null {
   return null;
 }
 
-function isToken(v: unknown): v is string {
-  return typeof v === 'string' && /^[a-z0-9][a-z0-9_-]*$/i.test(v);
-}
-
 function validateCommand(parsed: unknown): NLCommand | null {
   if (!parsed || typeof parsed !== 'object') return null;
   const obj = parsed as Record<string, unknown>;
   const kind = obj.kind;
   if (typeof kind !== 'string') return null;
 
-  const target = typeof obj.target === 'string'
-    ? obj.target.toLowerCase().replace(/^[@#]/, '')
-    : undefined;
+  const target = typeof obj.target === 'string' ? parseTargetToken(obj.target) : undefined;
 
   switch (kind) {
     case 'spinUp':
@@ -171,11 +165,11 @@ function validateCommand(parsed: unknown): NLCommand | null {
     case 'retire':
     case 'pin':
     case 'unpin':
-      if (!target || !isToken(target)) return null;
+      if (!target) return null;
       return { kind, target };
 
     case 'create': {
-      if (!target || !isToken(target)) return null;
+      if (!target) return null;
       const out: NLCommand = { kind: 'create', target };
       if (typeof obj.configDir === 'string') out.configDir = obj.configDir;
       if (obj.noSpin === true) out.noSpin = true;
@@ -185,7 +179,7 @@ function validateCommand(parsed: unknown): NLCommand | null {
     }
 
     case 'update': {
-      if (!target || !isToken(target)) return null;
+      if (!target) return null;
       const out: NLCommand = { kind: 'update', target };
       if (typeof obj.configDir === 'string') out.configDir = obj.configDir;
       if (obj.clearConfig === true) out.clearConfig = true;
@@ -198,10 +192,10 @@ function validateCommand(parsed: unknown): NLCommand | null {
       return { kind: 'listActive' };
 
     case 'status':
-      return { kind: 'status', target: target && isToken(target) ? target : undefined };
+      return { kind: 'status', target };
 
     case 'logs': {
-      if (!target || !isToken(target)) return null;
+      if (!target) return null;
       const n = typeof obj.n === 'number' && Number.isFinite(obj.n) && obj.n > 0
         ? Math.floor(obj.n)
         : 30;
@@ -209,8 +203,8 @@ function validateCommand(parsed: unknown): NLCommand | null {
     }
 
     case 'createFolder': {
-      const name = typeof obj.name === 'string' ? obj.name : undefined;
-      if (!name || !isToken(name)) return null;
+      const name = typeof obj.name === 'string' ? parseTargetToken(obj.name) : undefined;
+      if (!name) return null;
       const out: NLCommand = { kind: 'createFolder', name };
       if (typeof obj.description === 'string') out.description = obj.description;
       return out;
@@ -220,19 +214,15 @@ function validateCommand(parsed: unknown): NLCommand | null {
       return { kind: 'listFolders' };
 
     case 'setFolder': {
-      const stream = typeof obj.stream === 'string'
-        ? obj.stream.toLowerCase().replace(/^[@#]/, '')
-        : undefined;
+      const stream = typeof obj.stream === 'string' ? parseTargetToken(obj.stream) : undefined;
       const folder = typeof obj.folder === 'string' ? obj.folder : undefined;
-      if (!stream || !isToken(stream) || !folder) return null;
+      if (!stream || !folder) return null;
       return { kind: 'setFolder', stream, folder };
     }
 
     case 'clearFolder': {
-      const stream = typeof obj.stream === 'string'
-        ? obj.stream.toLowerCase().replace(/^[@#]/, '')
-        : undefined;
-      if (!stream || !isToken(stream)) return null;
+      const stream = typeof obj.stream === 'string' ? parseTargetToken(obj.stream) : undefined;
+      if (!stream) return null;
       return { kind: 'clearFolder', stream };
     }
 

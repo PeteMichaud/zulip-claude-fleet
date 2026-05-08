@@ -79,7 +79,7 @@ type Pending = {
 
 export function makeHeartbeat(
   zulip: ZulipClient,
-  debug: (...parts: unknown[]) => void = () => {},
+  log: (...parts: unknown[]) => void = () => {},
   opts: { longSilenceMs?: number; tickIntervalMs?: number } = {},
 ): Heartbeat {
   const longSilenceMs = opts.longSilenceMs ?? LONG_SILENCE_MS;
@@ -109,7 +109,7 @@ export function makeHeartbeat(
     try {
       await react(p.msgId, toEmoji, 'POST');
     } catch (err: any) {
-      debug(`heartbeat: ${target} react failed (non-fatal):`, err.message);
+      log(`heartbeat: ${target} react failed (non-fatal):`, err.message);
     }
   }
 
@@ -145,7 +145,7 @@ export function makeHeartbeat(
       });
       // Fire-and-forget initial 👀 — don't block message handoff to Claude.
       react(messageId, STAGE_EMOJI.eyes, 'POST').catch((err: any) =>
-        debug('heartbeat: eyes react failed (non-fatal):', err.message),
+        log('heartbeat: eyes react failed (non-fatal):', err.message),
       );
       ensureTicker();
     },
