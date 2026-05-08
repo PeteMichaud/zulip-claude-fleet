@@ -45,6 +45,44 @@ const DEFAULT_TOPIC = 'chat';
 // the owner so prompts appear inline with the active conversation.
 let lastInbound: { stream: string; topic: string } = { stream: HOME_STREAM, topic: DEFAULT_TOPIC };
 
+// Heartbeat: Zulip msg IDs of inbounds we've reacted 👀 to but haven't yet
+// acknowledged with ✅. Drained on the first `send` after an inbound arrives,
+// so the operator gets per-message liveness ("seen" vs "replied") without
+// extra chat noise. Sleeping bots also populate this from the wake trigger.
+const HEARTBEAT_EYES = 'eyes';
+const HEARTBEAT_DONE = 'white_check_mark';
+const pendingHeartbeats: number[] = [];
+
+function noteInboundForHeartbeat(messageId: number) {
+  pendingHeartbeats.push(messageId);
+  // Fire-and-forget — don't block message handoff to Claude on a reaction POST.
+  zulip(`/messages/${messageId}/reactions`, {
+    method: 'POST',
+    params: { emoji_name: HEARTBEAT_EYES },
+  }).catch((err: any) => debug('heartbeat: 👀 react failed (non-fatal):', err.message));
+}
+
+async function ackHeartbeats() {
+  if (pendingHeartbeats.length === 0) return;
+  const ids = pendingHeartbeats.splice(0);
+  for (const id of ids) {
+    try {
+      await zulip(`/messages/${id}/reactions`, {
+        method: 'DELETE',
+        params: { emoji_name: HEARTBEAT_EYES },
+      });
+    } catch { /* 👀 may not have landed yet — fine, we're just adding ✅ */ }
+    try {
+      await zulip(`/messages/${id}/reactions`, {
+        method: 'POST',
+        params: { emoji_name: HEARTBEAT_DONE },
+      });
+    } catch (err: any) {
+      debug('heartbeat: ✅ react failed (non-fatal):', err.message);
+    }
+  }
+}
+
 // ---------- Zulip API client ----------
 const zulip = makeZulipClient({ site: SITE, email: BOT_EMAIL, apiKey: API_KEY });
 
@@ -142,6 +180,7 @@ async function sendTool(args: { text: string; stream?: string; topic?: string })
       params: { type: 'stream', to: stream, topic, content: prefix + chunks[i] },
     });
   }
+  await ackHeartbeats();
   return {
     content: [
       { type: 'text', text: `sent (${chunks.length} message${chunks.length > 1 ? 's' : ''}) to ${stream} > ${topic}` },
@@ -270,7 +309,7 @@ async function replayWakeTriggerIfPresent() {
   const path = '.wake-trigger.json';
   if (!existsSync(path)) return;
 
-  let parsed: { stream?: string; topic?: string; sender?: string; content?: string };
+  let parsed: { stream?: string; topic?: string; sender?: string; content?: string; inbound_message_id?: number };
   try {
     parsed = JSON.parse(readFileSync(path, 'utf-8'));
   } catch (err: any) {
@@ -289,6 +328,10 @@ async function replayWakeTriggerIfPresent() {
   // Match the same lastInbound bookkeeping handleMessage does, so any
   // immediate permission prompt routes back to where the wake came from.
   lastInbound = { stream: parsed.stream, topic };
+
+  if (typeof parsed.inbound_message_id === 'number') {
+    noteInboundForHeartbeat(parsed.inbound_message_id);
+  }
 
   await mcp.notification({
     method: 'notifications/claude/channel',
@@ -360,6 +403,7 @@ async function handleMessage(event: any) {
   const stream = typeof msg.display_recipient === 'string' ? msg.display_recipient : HOME_STREAM;
   const topic = msg.subject || DEFAULT_TOPIC;
   lastInbound = { stream, topic };
+  if (typeof msg.id === 'number') noteInboundForHeartbeat(msg.id);
   await mcp.notification({
     method: 'notifications/claude/channel',
     params: {

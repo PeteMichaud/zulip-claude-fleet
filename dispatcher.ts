@@ -22,7 +22,7 @@ import { parseCommand } from './lib/commands.ts';
 import { humanDuration } from './lib/format.ts';
 
 type Subprocess = ReturnType<typeof Bun.spawn>;
-type WakeTrigger = { stream: string; topic: string; sender: string; content: string };
+type WakeTrigger = { stream: string; topic: string; sender: string; content: string; inbound_message_id?: number };
 
 // ---------- Config ----------
 
@@ -226,6 +226,27 @@ log(`auth ok: ${me.email} (user_id ${me.user_id}); registered bots: [${Object.ke
 // our forward posts (@-mention relay, see processMentions below).
 const DISPATCH_BOT_USER_ID: number = me.user_id;
 
+// Self-heal subscriptions: the event queue only sees messages in streams
+// dispatch-bot is subscribed to. If it gets unsubscribed (manual toggle in
+// the Zulip UI, etc.) inbounds vanish silently. Re-subscribe at startup —
+// idempotent on Zulip's side, so this is a no-op when already in place.
+{
+  const homeStreams = Object.values(REGISTRY).map((b) => ({ name: b.home_stream }));
+  if (homeStreams.length > 0) {
+    try {
+      const result = await zulip('/users/me/subscriptions', {
+        method: 'POST',
+        params: { subscriptions: homeStreams },
+      });
+      const added: string[] = Object.keys(result.subscribed?.[me.email] ?? {});
+      if (added.length > 0) log(`subscribed dispatch-bot to: [${added.join(', ')}]`);
+      else log(`already subscribed to all ${homeStreams.length} bot home streams`);
+    } catch (err: any) {
+      log(`WARN: self-subscribe failed (${err.message}) — inbounds may not be received`);
+    }
+  }
+}
+
 // ---------- Zulip event queue ----------
 
 let queueId: string | undefined;
@@ -404,6 +425,10 @@ async function maybeSpawn(bot: Bot, trigger: WakeTrigger): Promise<void> {
       log(`@${bot.name} already alive; not respawning (its own MCP will handle this inbound)`);
       return;
     }
+    // Reset the idle clock at spawn — last_active persists across sessions, so
+    // without this a long-asleep bot would be killed by the next idle sweep
+    // before it could process the wake trigger.
+    bumpActivity(bot.name);
     await spawnBot(bot, trigger);
   } catch (err: any) {
     log(`@${bot.name} spawn failed: ${err.message}`);
@@ -467,6 +492,7 @@ async function handleMessage(event: any) {
         topic: msg.subject || 'chat',
         sender: msg.sender_full_name ?? '',
         content: msg.content ?? '',
+        inbound_message_id: msg.id,
       };
       await maybeSpawn(homeBot, trigger);
     }
