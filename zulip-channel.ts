@@ -126,7 +126,13 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => {
 };
 });
 
+// Flipped on the first CallTool from Claude. Used by the wake-trigger
+// watchdog: ListTools alone doesn't prove Claude is processing channel
+// notifications (it fires during init), but a real tool call does.
+let claudeMadeToolCall = false;
+
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
+  claudeMadeToolCall = true;
   const args = (req.params.arguments ?? {}) as Record<string, any>;
   if (req.params.name === 'send') return await sendTool(args);
   if (req.params.name === 'read') return await readTool(args);
@@ -331,14 +337,19 @@ debug('MCP transport connected; capabilities advertised: claude/channel, claude/
 // receive it — the channel listener isn't fully wired yet on Claude Code's
 // side. We defer until after the first ListTools request, which Claude Code
 // issues during its post-init tool discovery; by then the channel pipeline is
-// live. Belt-and-braces: also defer at least 500ms regardless.
+// live. Belt-and-braces: also defer at least 1s regardless.
+//
+// Buffer was bumped from 200ms → 1000ms when we hit a `--resume` silent-drop:
+// under resume, ListTools fires while Claude is mid-restoration and the
+// channel notification arriving 200ms later got dropped before Claude was
+// ready to dispatch it. The watchdog inside replayWakeTriggerIfPresent
+// catches the residual case where 1s still isn't enough.
 const waitForReady = (async () => {
   const deadline = Date.now() + 2000;
   while (listToolsCalledAt === null && Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 50));
   }
-  // Either ListTools fired or we hit the 2s ceiling; small buffer either way.
-  await new Promise((r) => setTimeout(r, 200));
+  await new Promise((r) => setTimeout(r, 1000));
   debug('wake-trigger: ready signal (listToolsCalledAt=' + listToolsCalledAt + ')');
 })();
 waitForReady.then(replayWakeTriggerIfPresent).catch((err) => debug('wake-trigger: replay failed:', err.message));
@@ -371,18 +382,43 @@ async function replayWakeTriggerIfPresent() {
     heartbeat.note(parsed.inbound_message_id);
   }
 
-  await mcp.notification({
+  const sendNotification = () => mcp.notification({
     method: 'notifications/claude/channel',
     params: {
-      content: parsed.content,
+      content: parsed.content!,
       meta: {
-        stream: parsed.stream,
+        stream: parsed.stream!,
         topic,
         sender: parsed.sender ?? '',
       },
     },
   });
 
+  await sendNotification();
+
+  // --resume silent-drop watchdog: if Claude makes no tool call (other than
+  // the init-time ListTools) within WAKE_RETRY_MS of the replay, the
+  // notification was likely dropped during resume restoration. Re-send once.
+  // After the retry, log loud if still nothing — at that point Claude is
+  // genuinely wedged and the operator has to intervene (reset / kill).
+  const WAKE_RETRY_MS = 10_000;
+  setTimeout(async () => {
+    if (claudeMadeToolCall) return;
+    debug('wake-trigger: watchdog tripped (no CallTool in 10s); resending notification');
+    try {
+      await sendNotification();
+    } catch (err: any) {
+      debug('wake-trigger: resend failed:', err.message);
+      return;
+    }
+    setTimeout(() => {
+      if (claudeMadeToolCall) return;
+      debug('wake-trigger: ERROR — still no CallTool 10s after resend; bot is wedged. Operator should `reset` it.');
+    }, WAKE_RETRY_MS);
+  }, WAKE_RETRY_MS);
+
+  // The file isn't needed anymore — watchdog retries use the in-memory
+  // parsed object. Unlink so a future spawn doesn't replay stale content.
   try {
     unlinkSync(path);
   } catch (err: any) {
