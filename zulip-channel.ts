@@ -153,22 +153,32 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => {
 // notifications (it fires during init), but a real tool call does.
 let claudeMadeToolCall = false;
 
+// Tracked so SIGTERM/SIGINT can cancel pending wake-trigger watchdog retries
+// before they fire after teardown. Set by replayWakeTriggerIfPresent below.
+const wakeWatchdogTimers = new Set<ReturnType<typeof setTimeout>>();
+
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   claudeMadeToolCall = true;
-  const args = (req.params.arguments ?? {}) as Record<string, any>;
+  const args = req.params.arguments ?? {};
   if (req.params.name === 'send') return await sendTool(args);
   if (req.params.name === 'read') return await readTool(args);
   throw new Error(`unknown tool: ${req.params.name}`);
 });
 
-async function sendTool(args: { text: string; stream?: string; topic?: string }) {
-  if (typeof args.text !== 'string' || args.text.length === 0) {
+// MCP tool handler signatures take `Record<string, unknown>` because that's
+// what `req.params.arguments` actually carries — the JSON-Schema validation
+// on the tool's `inputSchema` runs Claude-side, but the handler still gets
+// the unvalidated object. Each tool narrows internally and throws on
+// invalid shapes.
+async function sendTool(args: Record<string, unknown>) {
+  const text = args.text;
+  if (typeof text !== 'string' || text.length === 0) {
     throw new Error('send: "text" is required and must be a non-empty string');
   }
-  const stream = args.stream ?? HOME_STREAM;
-  const topic = args.topic ?? DEFAULT_TOPIC;
+  const stream = typeof args.stream === 'string' ? args.stream : HOME_STREAM;
+  const topic = typeof args.topic === 'string' ? args.topic : DEFAULT_TOPIC;
 
-  const chunks = chunkMessage(args.text, ZULIP_MSG_LIMIT - 100);
+  const chunks = chunkMessage(text, ZULIP_MSG_LIMIT - 100);
   for (let i = 0; i < chunks.length; i++) {
     const prefix = chunks.length > 1 ? `*(part ${i + 1}/${chunks.length})*\n\n` : '';
     await zulip('/messages', {
@@ -184,17 +194,20 @@ async function sendTool(args: { text: string; stream?: string; topic?: string })
   };
 }
 
-async function readTool(args: { stream: string; limit?: number; anchor?: string }) {
-  if (typeof args.stream !== 'string' || !args.stream) {
+async function readTool(args: Record<string, unknown>) {
+  const stream = args.stream;
+  if (typeof stream !== 'string' || !stream) {
     throw new Error('read: "stream" is required');
   }
-  const num = Math.min(args.limit ?? READ_DEFAULT, READ_MAX);
+  const limit = typeof args.limit === 'number' ? args.limit : READ_DEFAULT;
+  const anchor = typeof args.anchor === 'string' ? args.anchor : 'newest';
+  const num = Math.min(limit, READ_MAX);
   const data = await zulip('/messages', {
     params: {
-      anchor: args.anchor ?? 'newest',
+      anchor,
       num_before: num,
       num_after: 0,
-      narrow: [['stream', args.stream]],
+      narrow: [['stream', stream]],
       apply_markdown: false,
     },
   });
@@ -443,8 +456,12 @@ async function replayWakeTriggerIfPresent() {
   // notification was likely dropped during resume restoration. Re-send once.
   // After the retry, log loud if still nothing — at that point Claude is
   // genuinely wedged and the operator has to intervene (reset / kill).
+  // Timer handles tracked so SIGTERM/SIGINT can cancel them; otherwise the
+  // callbacks fire after process exit (or worse, after the channel server
+  // tears down but before Bun reaps the process).
   const WAKE_RETRY_MS = 10_000;
-  setTimeout(async () => {
+  const retry = setTimeout(async () => {
+    wakeWatchdogTimers.delete(retry);
     if (claudeMadeToolCall) return;
     debug('wake-trigger: watchdog tripped (no CallTool in 10s); resending notification');
     try {
@@ -453,11 +470,14 @@ async function replayWakeTriggerIfPresent() {
       debug('wake-trigger: resend failed:', err.message);
       return;
     }
-    setTimeout(() => {
+    const followup = setTimeout(() => {
+      wakeWatchdogTimers.delete(followup);
       if (claudeMadeToolCall) return;
       debug('wake-trigger: ERROR — still no CallTool 10s after resend; bot is wedged. Operator should `reset` it.');
     }, WAKE_RETRY_MS);
+    wakeWatchdogTimers.add(followup);
   }, WAKE_RETRY_MS);
+  wakeWatchdogTimers.add(retry);
 
   // The file isn't needed anymore — watchdog retries use the in-memory
   // parsed object. Unlink so a future spawn doesn't replay stale content.
@@ -556,7 +576,11 @@ await registerQueue();
 
 // ---------- Main event loop ----------
 let running = true;
-const shutdown = () => { running = false; };
+const shutdown = () => {
+  running = false;
+  for (const t of wakeWatchdogTimers) clearTimeout(t);
+  wakeWatchdogTimers.clear();
+};
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
 
