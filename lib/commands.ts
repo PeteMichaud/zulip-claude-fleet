@@ -6,7 +6,7 @@ export type Command =
   | { kind: 'spinUp'; target: string }
   | { kind: 'shutDown'; target: string }
   | { kind: 'reset'; target: string }
-  | { kind: 'create'; target: string; configDir?: string }
+  | { kind: 'create'; target: string; configDir?: string; noSpin?: boolean }
   | { kind: 'update'; target: string; configDir?: string; clearConfig?: boolean }
   | { kind: 'retire'; target: string }
   | { kind: 'listActive' }
@@ -145,7 +145,11 @@ export function parseCommand(text: string): Command {
       if (!target) return { kind: 'unknown', text: trimmed };
       const configFlag = flags.get('config');
       const configDir = typeof configFlag === 'string' ? configFlag : undefined;
-      return configDir ? { kind: 'create', target, configDir } : { kind: 'create', target };
+      const noSpin = flags.get('no-spin') === true;
+      const out: Command = { kind: 'create', target };
+      if (configDir) out.configDir = configDir;
+      if (noSpin) out.noSpin = true;
+      return out;
     }
 
     case 'update': {

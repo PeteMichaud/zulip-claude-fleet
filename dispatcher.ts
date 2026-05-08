@@ -646,7 +646,7 @@ async function handleDispatchCommand(msg: any): Promise<void> {
     case 'spinUp':     return cmdSpinUp(topic, cmd.target);
     case 'shutDown':   return cmdShutDown(topic, cmd.target);
     case 'reset':      return cmdReset(topic, cmd.target);
-    case 'create':     return cmdCreate(topic, cmd.target, cmd.configDir);
+    case 'create':     return cmdCreate(topic, cmd.target, cmd.configDir, cmd.noSpin ?? false);
     case 'update':     return cmdUpdate(topic, cmd.target, cmd);
     case 'retire':     return cmdRetire(topic, cmd.target);
     case 'listActive': return cmdListActive(topic);
@@ -728,7 +728,7 @@ async function cmdReset(topic: string, name: string): Promise<void> {
 // Provision a new bot end-to-end. Bot creation goes through the owner's
 // credentials because Zulip's /bots endpoint rejects bot callers; everything
 // else uses dispatch-bot.
-async function cmdCreate(topic: string, name: string, configDir?: string): Promise<void> {
+async function cmdCreate(topic: string, name: string, configDir?: string, noSpin = false): Promise<void> {
   if (!/^[a-z][a-z0-9_-]*$/.test(name)) {
     return postToDispatch(topic, `invalid name \`${name}\` — must start with a lowercase letter and contain only [a-z0-9_-]`);
   }
@@ -830,8 +830,14 @@ async function cmdCreate(topic: string, name: string, configDir?: string): Promi
     `- working tree: \`${cwd}\``,
   ];
   if (configDir) lines.push(`- config dir: \`${configDir}\` (per-bot override)`);
-  lines.push(`Run \`spin up ${name}\` and tell it what kind of bot to be.`);
+  if (noSpin) {
+    lines.push(`Run \`spin up ${name}\` and tell it what kind of bot to be.`);
+    await postToDispatch(topic, lines.join('\n'));
+    return;
+  }
+  lines.push(`Spinning up @${name} now — say what kind of bot it should be in #${name}.`);
   await postToDispatch(topic, lines.join('\n'));
+  await cmdSpinUp(topic, name);
 }
 
 // Mutate a bot's registry entry. Today only --config / --clear-config are
@@ -1098,7 +1104,7 @@ async function cmdHelp(topic: string): Promise<void> {
     ['spin up @<bot>', 'start that bot (resumes prior session if known)', 'wake, wake up, start'],
     ['shut down @<bot>', 'kill that bot (next start will resume)', 'stop, kill'],
     ['reset @<bot>', 'kill and clear stored session; next start is fresh'],
-    ['create <name> [--config <path>]', 'provision a new bot end-to-end', 'create-bot'],
+    ['create <name> [--config <path>] [--no-spin]', 'provision a new bot end-to-end and spin it up (use --no-spin to skip)', 'create-bot'],
     ['update <name> [--config <path> | --clear-config]', 'change a bot\'s per-bot settings (clears session so changes take effect)'],
     ['retire <name>', 'kill, deactivate Zulip bot, archive stream, remove from registry'],
     ['list active', 'running bots + uptime', 'list'],

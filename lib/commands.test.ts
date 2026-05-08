@@ -52,6 +52,22 @@ describe('parseCommand', () => {
     });
   });
 
+  test('create with --no-spin opts out of auto spin-up', () => {
+    expect(parseCommand('create writer --no-spin')).toEqual({
+      kind: 'create',
+      target: 'writer',
+      noSpin: true,
+    });
+    expect(parseCommand('create writer --no-spin --config ~/.claude-mimo')).toEqual({
+      kind: 'create',
+      target: 'writer',
+      configDir: '~/.claude-mimo',
+      noSpin: true,
+    });
+    // Default: no --no-spin → noSpin field absent (auto spin-up is on).
+    expect(parseCommand('create writer')).toEqual({ kind: 'create', target: 'writer' });
+  });
+
   test('update with --config / --clear-config', () => {
     expect(parseCommand('update writer --config ~/.claude-mimo')).toEqual({
       kind: 'update',
