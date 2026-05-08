@@ -26,6 +26,7 @@ import { isIdle, makeBotStateStore } from './lib/state.ts';
 import { makeSpawnOrchestrator } from './lib/spawn-orchestrator.ts';
 import { runStartupSequence } from './lib/startup.ts';
 import type { Bot, Subprocess, WakeTrigger } from './lib/types.ts';
+import { fetchMessagesSince } from './lib/zulip-catchup.ts';
 
 // ---------- Config ----------
 
@@ -191,6 +192,11 @@ const DISPATCH_BOT_USER_ID: number = me.user_id;
 
 let queueId: string | undefined;
 let lastEventId = -1;
+// Bookmark of the highest msg.id we've successfully handed off to handleMessage.
+// Distinct from lastEventId (queue events are a different namespace and gone
+// when the queue dies). Used by the catch-up fetch on re-register to recover
+// messages buffered on the dying queue.
+let lastHandledMessageId = 0;
 
 async function registerQueue() {
   // No stream narrow: dispatch-bot is subscribed to its own stream + every
@@ -779,6 +785,37 @@ const idleTimer = setInterval(() => {
 }, IDLE_CHECK_INTERVAL_MS);
 log(`idle shutdown enabled: ${humanDuration(IDLE_TIMEOUT_MS)} threshold, sweep every ${humanDuration(IDLE_CHECK_INTERVAL_MS)}`);
 
+async function dispatchEventMessage(event: any): Promise<void> {
+  await handleMessage(event);
+  const msgId = event?.message?.id;
+  if (typeof msgId === 'number' && msgId > lastHandledMessageId) {
+    lastHandledMessageId = msgId;
+  }
+}
+
+// After re-registering (queue death), fetch any messages that arrived in
+// the gap and replay them through handleMessage. Bookmark advances inside
+// dispatchEventMessage so successive re-registers don't re-replay.
+async function catchUpMissedMessages(): Promise<void> {
+  if (lastHandledMessageId === 0) return; // first ever register; nothing to catch up
+  let missed: any[];
+  try {
+    missed = await fetchMessagesSince({ zulip, sinceMessageId: lastHandledMessageId });
+  } catch (err: any) {
+    log(`catch-up fetch failed (proceeding without): ${err.message}`);
+    return;
+  }
+  if (missed.length === 0) return;
+  log(`replaying ${missed.length} message${missed.length === 1 ? '' : 's'} missed during queue gap (since msg ${lastHandledMessageId})`);
+  for (const message of missed) {
+    try {
+      await dispatchEventMessage({ message });
+    } catch (err: any) {
+      log(`catch-up replay error on msg ${message.id}: ${err.message}`);
+    }
+  }
+}
+
 while (running) {
   try {
     const data = await zulip('/events', {
@@ -788,7 +825,7 @@ while (running) {
     for (const event of data.events) {
       lastEventId = Math.max(lastEventId, event.id);
       try {
-        if (event.type === 'message') await handleMessage(event);
+        if (event.type === 'message') await dispatchEventMessage(event);
       } catch (err: any) {
         log('handler error:', err.message);
       }
@@ -800,6 +837,7 @@ while (running) {
       log('event queue expired; re-registering');
       try {
         await registerQueue();
+        await catchUpMissedMessages();
       } catch (e: any) {
         log('re-register failed, retrying in 5s:', e.message);
         await new Promise((r) => setTimeout(r, 5000));
