@@ -3,11 +3,17 @@
 // signal of whether the bot saw the message and whether it produced a reply,
 // without polluting the chat with extra messages. Caller is responsible for
 // invoking `note(msgId)` at handoff and `ack()` after a successful send.
+//
+// The "done" emoji name is `check` (Zulip's :check: → ✓), not the standard
+// unicode `white_check_mark`. Many Zulip realms (including ours) don't have
+// `white_check_mark` in their emoji set; using it produced silent 400s on
+// every ack and the 👀 stayed forever. `check` matches what the existing
+// permission-relay reactions use, so we know it works.
 
 import type { ZulipClient } from './zulip.ts';
 
 export const HEARTBEAT_EYES = 'eyes';
-export const HEARTBEAT_DONE = 'white_check_mark';
+export const HEARTBEAT_DONE = 'check';
 
 export type Heartbeat = {
   note(messageId: number): void;
