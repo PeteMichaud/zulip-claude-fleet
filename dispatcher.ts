@@ -442,6 +442,15 @@ async function handleMessage(event: any) {
     bumpActivity(homeBot.name);
   } else if (issuingBot) {
     bumpActivity(issuingBot.name);
+    // Bot's own first post in its home stream after a spawn → spawn done,
+    // clear the ♻️ marker so 👀/✅ stand alone.
+    if (issuingBot.name === homeBot.name) {
+      const inboundMsgId = pendingRecycle.get(homeBot.name);
+      if (inboundMsgId !== undefined) {
+        pendingRecycle.delete(homeBot.name);
+        clearRecycle(inboundMsgId);
+      }
+    }
   }
 
   // Wake-up logic: only the operator's messages summon a sleeping bot. A
@@ -452,6 +461,12 @@ async function handleMessage(event: any) {
     log(`inbound for @${homeBot.name}: topic="${msg.subject ?? ''}" sender="${msg.sender_full_name ?? ''}" content=${JSON.stringify(snippet)}`);
 
     if (!isAlive(homeBot.name)) {
+      // Spawn-window indicator. Track the inbound msg.id so we can clear
+      // the ♻️ when the bot's first self-post lands.
+      if (typeof msg.id === 'number') {
+        pendingRecycle.set(homeBot.name, msg.id);
+        reactRecycle(msg.id);
+      }
       const trigger: WakeTrigger = {
         stream,
         topic: msg.subject || 'chat',
@@ -476,6 +491,28 @@ async function handleMessage(event: any) {
 // propagate @-mentions originating from one bot to another.
 function botFromSender(senderEmail: string): Bot | undefined {
   return Object.values(REGISTRY).find((b) => b.bot_email === senderEmail);
+}
+
+// ---------- Spawn-window UI ----------
+// When the dispatcher kicks off a fresh spawn (sleeping bot, owner message),
+// react ♻️ on the inbound so the operator sees "booting." Channel server then
+// layers 👀 on top once Claude has the message in hand. We clear the ♻️ when
+// the bot's first self-post lands in home stream — earliest signal that the
+// spawn has completed and Claude is replying.
+const pendingRecycle = new Map<string, number>(); // botName → inbound msg.id
+
+function reactRecycle(msgId: number): void {
+  zulip(`/messages/${msgId}/reactions`, {
+    method: 'POST',
+    params: { emoji_name: 'recycle' },
+  }).catch((err: any) => log(`recycle: react failed (non-fatal): ${err.message}`));
+}
+
+function clearRecycle(msgId: number): void {
+  zulip(`/messages/${msgId}/reactions`, {
+    method: 'DELETE',
+    params: { emoji_name: 'recycle' },
+  }).catch((err: any) => log(`recycle: clear failed (non-fatal): ${err.message}`));
 }
 
 // ---------- @-mention relay ----------
