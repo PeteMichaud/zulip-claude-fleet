@@ -255,3 +255,54 @@ export function parseCommand(text: string): Command {
       return { kind: 'help' };
   }
 }
+
+// Canonical string form for a Command. Used to echo NL-interpreted commands
+// back to the operator before executing ("interpreting as: spin up writer").
+export function renderCommand(cmd: Command): string {
+  switch (cmd.kind) {
+    case 'spinUp':   return `spin up ${cmd.target}`;
+    case 'shutDown': return `shut down ${cmd.target}`;
+    case 'reset':    return `reset ${cmd.target}`;
+    case 'retire':   return `retire ${cmd.target}`;
+    case 'create': {
+      const parts = ['create', cmd.target];
+      if (cmd.configDir) parts.push('--config', cmd.configDir);
+      if (cmd.noSpin) parts.push('--no-spin');
+      if (cmd.auto) parts.push('--auto');
+      if (cmd.yolo) parts.push('--yolo');
+      return parts.join(' ');
+    }
+    case 'update': {
+      const parts = ['update', cmd.target];
+      if (cmd.configDir) parts.push('--config', cmd.configDir);
+      if (cmd.clearConfig) parts.push('--clear-config');
+      if (cmd.auto === true) parts.push('--auto');
+      if (cmd.auto === false) parts.push('--no-auto');
+      if (cmd.yolo === true) parts.push('--yolo');
+      if (cmd.yolo === false) parts.push('--no-yolo');
+      return parts.join(' ');
+    }
+    case 'listActive':   return 'list active';
+    case 'status':       return cmd.target ? `status ${cmd.target}` : 'status';
+    case 'logs':         return `logs ${cmd.target} ${cmd.n}`;
+    case 'pin':          return `pin ${cmd.target}`;
+    case 'unpin':        return `unpin ${cmd.target}`;
+    case 'createFolder': {
+      const parts = ['create folder', cmd.name];
+      if (cmd.description) parts.push('--description', cmd.description);
+      return parts.join(' ');
+    }
+    case 'listFolders':  return 'list folders';
+    case 'setFolder':    return `set folder ${cmd.stream} ${cmd.folder}`;
+    case 'clearFolder':  return `clear folder ${cmd.stream}`;
+    case 'help':         return 'help';
+    case 'unknown':      return cmd.text;
+  }
+}
+
+// Destructive commands need explicit confirmation when they arrive via the
+// NL fallback (the user typed something ambiguous; we shouldn't terminate or
+// wipe a session on a guess).
+export function isDestructive(cmd: Command): boolean {
+  return cmd.kind === 'retire' || cmd.kind === 'reset';
+}

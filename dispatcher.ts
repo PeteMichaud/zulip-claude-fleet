@@ -26,12 +26,8 @@ import {
   setStreamFolder,
   setStreamPin,
 } from './lib/zulip-admin.ts';
-import { parseCommand } from './lib/commands.ts';
-import {
-  classifySender,
-  NL_EXEC_TOPIC,
-  routeDispatchMessage,
-} from './lib/dispatch-routing.ts';
+import { isDestructive, parseCommand, renderCommand, type Command } from './lib/commands.ts';
+import { nlDispatch } from './lib/nl-dispatch.ts';
 import { humanDuration } from './lib/format.ts';
 import { isIdle, makeBotStateStore, type BotState } from './lib/state.ts';
 import { makeSpawnOrchestrator } from './lib/spawn-orchestrator.ts';
@@ -711,37 +707,55 @@ async function handleDispatchCommand(msg: any): Promise<void> {
       return;
     }
   }
+  if (cmd.kind !== 'unknown') return executeCommand(cmd, topic);
+
+  // Not a regex-parseable command. Try mention forwarding first (the
+  // operator may be chatting *to* a bot from #Dispatch). If nothing was
+  // forwarded and the sender is the owner, fall through to the NL parser.
+  const forwarded = await processMentions(msg, DISPATCH_STREAM, undefined);
+  if (forwarded > 0) return;
+
+  const interp = await nlDispatch(text);
+  if (!interp) {
+    await postToDispatch(topic, `unrecognized: \`${cmd.text}\`. try \`help\`.`);
+    return;
+  }
+
+  if (isDestructive(interp)) {
+    await postToDispatch(
+      topic,
+      `i think you mean \`${renderCommand(interp)}\` — destructive, so type it explicitly to run.`,
+    );
+    return;
+  }
+
+  await postToDispatch(topic, `interpreting as \`${renderCommand(interp)}\``);
+  return executeCommand(interp, topic);
+}
+
+function executeCommand(cmd: Exclude<Command, { kind: 'unknown' }>, topic: string): Promise<void> {
   switch (cmd.kind) {
-    case 'spinUp':     return cmdSpinUp(topic, cmd.target);
-    case 'shutDown':   return cmdShutDown(topic, cmd.target);
-    case 'reset':      return cmdReset(topic, cmd.target);
-    case 'create':     return cmdCreate(topic, cmd.target, {
+    case 'spinUp':       return cmdSpinUp(topic, cmd.target);
+    case 'shutDown':     return cmdShutDown(topic, cmd.target);
+    case 'reset':        return cmdReset(topic, cmd.target);
+    case 'create':       return cmdCreate(topic, cmd.target, {
       configDir: cmd.configDir,
       noSpin: cmd.noSpin ?? false,
       auto: cmd.auto ?? false,
       yolo: cmd.yolo ?? false,
     });
-    case 'update':     return cmdUpdate(topic, cmd.target, cmd);
-    case 'retire':     return cmdRetire(topic, cmd.target);
-    case 'listActive': return cmdListActive(topic);
-    case 'status':     return cmdStatus(topic, cmd.target);
-    case 'logs':       return cmdLogs(topic, cmd.target, cmd.n);
-    case 'pin':        return cmdPin(topic, cmd.target, true);
-    case 'unpin':      return cmdPin(topic, cmd.target, false);
+    case 'update':       return cmdUpdate(topic, cmd.target, cmd);
+    case 'retire':       return cmdRetire(topic, cmd.target);
+    case 'listActive':   return cmdListActive(topic);
+    case 'status':       return cmdStatus(topic, cmd.target);
+    case 'logs':         return cmdLogs(topic, cmd.target, cmd.n);
+    case 'pin':          return cmdPin(topic, cmd.target, true);
+    case 'unpin':        return cmdPin(topic, cmd.target, false);
     case 'createFolder': return cmdCreateFolder(topic, cmd.name, cmd.description);
     case 'listFolders':  return cmdListFolders(topic);
     case 'setFolder':    return cmdSetFolder(topic, cmd.stream, cmd.folder);
     case 'clearFolder':  return cmdClearFolder(topic, cmd.stream);
-    case 'help':       return cmdHelp(topic);
-    case 'unknown': {
-      // Not a command — maybe it's chat that mentions a bot. #Dispatch
-      // doubles as a general "talk to any bot" surface so the operator
-      // doesn't have to switch streams.
-      const forwarded = await processMentions(msg, DISPATCH_STREAM, undefined);
-      if (forwarded === 0) {
-        await postToDispatch(topic, `unrecognized: \`${cmd.text}\`. try \`help\`.`);
-      }
-    }
+    case 'help':         return cmdHelp(topic);
   }
 }
 
