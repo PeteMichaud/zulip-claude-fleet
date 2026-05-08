@@ -1,5 +1,26 @@
 import { describe, expect, test } from 'bun:test';
-import { parseCommand, parseTargetToken } from './commands.ts';
+import { isDestructive, parseCommand, parseTargetToken } from './commands.ts';
+
+describe('isDestructive', () => {
+  // Load-bearing for the dispatcher's NL-plan rejection path: any destructive
+  // step in a multi-command plan refuses the whole batch (PR #12). If a new
+  // destructive verb is added (e.g. "purge"), it must be added here too.
+  test('flags retire and reset', () => {
+    expect(isDestructive({ kind: 'retire', target: 'foo' })).toBe(true);
+    expect(isDestructive({ kind: 'reset', target: 'foo' })).toBe(true);
+  });
+
+  test('does not flag non-destructive verbs', () => {
+    expect(isDestructive({ kind: 'spinUp', target: 'foo' })).toBe(false);
+    expect(isDestructive({ kind: 'shutDown', target: 'foo' })).toBe(false);
+    expect(isDestructive({ kind: 'create', target: 'foo' })).toBe(false);
+    expect(isDestructive({ kind: 'pin', target: 'foo' })).toBe(false);
+    expect(isDestructive({ kind: 'createFolder', name: 'SFC' })).toBe(false);
+    expect(isDestructive({ kind: 'setFolder', stream: 'briefing', folder: 'SFC' })).toBe(false);
+    expect(isDestructive({ kind: 'listActive' })).toBe(false);
+    expect(isDestructive({ kind: 'help' })).toBe(false);
+  });
+});
 
 describe('parseTargetToken', () => {
   test('strips leading @ or # and lowercases', () => {

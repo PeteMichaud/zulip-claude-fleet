@@ -124,6 +124,31 @@ describe('parseClaudeResponse', () => {
   test('help', () => {
     expect(parseClaudeResponse('[{"kind":"help"}]')).toEqual([{ kind: 'help' }]);
   });
+
+  // The exact symptom from 2026-05-08: Pete typed
+  //   "1. pin zulip-fleet 2. move briefing and linear into a new stream
+  //    folder called SFC 3. create a blank folder called Personal"
+  // and the dispatcher answered "unrecognized" because the protocol mapped
+  // multi-step inputs to {"kind":"none"} → null. With the array protocol,
+  // the same input round-trips through Claude as a 5-step plan with SFC
+  // preserved as-typed. This test pins both fixes (multi-step + folder case).
+  test('regression: 2026-05-08 multi-step "pin/move/create" input round-trips', () => {
+    const claudeOutput = JSON.stringify([
+      { kind: 'createFolder', name: 'SFC' },
+      { kind: 'setFolder', stream: 'briefing', folder: 'SFC' },
+      { kind: 'setFolder', stream: 'linear', folder: 'SFC' },
+      { kind: 'createFolder', name: 'Personal' },
+      { kind: 'pin', target: 'zulip-fleet' },
+    ]);
+    const plan = parseClaudeResponse(claudeOutput);
+    expect(plan).toEqual([
+      { kind: 'createFolder', name: 'SFC' },
+      { kind: 'setFolder', stream: 'briefing', folder: 'SFC' },
+      { kind: 'setFolder', stream: 'linear', folder: 'SFC' },
+      { kind: 'createFolder', name: 'Personal' },
+      { kind: 'pin', target: 'zulip-fleet' },
+    ]);
+  });
 });
 
 describe('nlDispatch', () => {
