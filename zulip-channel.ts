@@ -70,7 +70,10 @@ const heartbeat = makeHeartbeat(zulip, debug);
   );
   const watcher = startJsonlActivityWatcher({
     projectsDir,
-    onActivity: () => heartbeat.bumpActivity(),
+    onActivity: () => {
+      heartbeat.bumpActivity();
+      claudeIsAlive = true; // also clears the wake-trigger watchdog
+    },
     log: debug,
   });
   process.on('SIGTERM', () => watcher.stop());
@@ -149,17 +152,19 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => {
 };
 });
 
-// Flipped on the first CallTool from Claude. Used by the wake-trigger
-// watchdog: ListTools alone doesn't prove Claude is processing channel
-// notifications (it fires during init), but a real tool call does.
-let claudeMadeToolCall = false;
+// "Claude is alive and processing" signal for the wake-trigger watchdog.
+// Two sources count: a real CallTool from Claude, OR new bytes appearing in
+// the session JSONL (Opus extended-thinking turns can run minutes before
+// calling any tool — without the JSONL signal, the watchdog falsely declares
+// the bot wedged mid-thinking).
+let claudeIsAlive = false;
 
 // Tracked so SIGTERM/SIGINT can cancel pending wake-trigger watchdog retries
 // before they fire after teardown. Set by replayWakeTriggerIfPresent below.
 const wakeWatchdogTimers = new Set<ReturnType<typeof setTimeout>>();
 
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
-  claudeMadeToolCall = true;
+  claudeIsAlive = true;
   const args = req.params.arguments ?? {};
   if (req.params.name === 'send') return await sendTool(args);
   if (req.params.name === 'read') return await readTool(args);
@@ -452,19 +457,23 @@ async function replayWakeTriggerIfPresent() {
 
   await sendNotification();
 
-  // --resume silent-drop watchdog: if Claude makes no tool call (other than
-  // the init-time ListTools) within WAKE_RETRY_MS of the replay, the
-  // notification was likely dropped during resume restoration. Re-send once.
-  // After the retry, log loud if still nothing — at that point Claude is
-  // genuinely wedged and the operator has to intervene (reset / kill).
+  // --resume silent-drop watchdog: if Claude shows no signs of life within
+  // WAKE_RETRY_MS of the replay, the notification was likely dropped during
+  // resume restoration. Re-send once.
+  //
+  // "Signs of life" = claudeIsAlive flag, set by either a CallTool from
+  // Claude OR the JSONL tailer noticing new bytes in the session file.
+  // CallTool alone false-positives on long Opus extended-thinking turns;
+  // the JSONL signal closes that gap.
+  //
   // Timer handles tracked so SIGTERM/SIGINT can cancel them; otherwise the
   // callbacks fire after process exit (or worse, after the channel server
   // tears down but before Bun reaps the process).
   const WAKE_RETRY_MS = 10_000;
   const retry = setTimeout(async () => {
     wakeWatchdogTimers.delete(retry);
-    if (claudeMadeToolCall) return;
-    debug('wake-trigger: watchdog tripped (no CallTool in 10s); resending notification');
+    if (claudeIsAlive) return;
+    debug('wake-trigger: watchdog tripped (no Claude activity in 10s); resending notification');
     try {
       await sendNotification();
     } catch (err: any) {
@@ -473,8 +482,8 @@ async function replayWakeTriggerIfPresent() {
     }
     const followup = setTimeout(() => {
       wakeWatchdogTimers.delete(followup);
-      if (claudeMadeToolCall) return;
-      debug('wake-trigger: ERROR — still no CallTool 10s after resend; bot is wedged. Operator should `reset` it.');
+      if (claudeIsAlive) return;
+      debug('wake-trigger: ERROR — still no Claude activity 10s after resend; bot is wedged. Operator should `reset` it.');
     }, WAKE_RETRY_MS);
     wakeWatchdogTimers.add(followup);
   }, WAKE_RETRY_MS);
