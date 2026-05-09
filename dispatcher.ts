@@ -430,6 +430,7 @@ const handlers = makeDispatchHandlers({
   stateStore,
   configDirFor,
   ownerUserId: OWNER_USER_ID,
+  dispatchBotUserId: DISPATCH_BOT_USER_ID,
   dispatchStream: DISPATCH_STREAM,
   fleetRoot: FLEET_ROOT,
   retiredRoot: RETIRED_ROOT,
