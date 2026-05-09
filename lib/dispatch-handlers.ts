@@ -37,6 +37,7 @@ export type DispatchCtx = {
   stateStore: BotStateStore;
   configDirFor: (bot: Bot) => string;
   ownerUserId: number;
+  dispatchBotUserId: number;
   dispatchStream: string;
   fleetRoot: string;
   retiredRoot: string;
@@ -51,8 +52,8 @@ export type DispatchHandlers = {
 export function makeDispatchHandlers(ctx: DispatchCtx): DispatchHandlers {
   const {
     zulip, zulipAsOwner, log, registry, saveRegistry, runningBots, startTimes,
-    isAlive, maybeSpawn, stateStore, configDirFor, ownerUserId, dispatchStream,
-    fleetRoot, retiredRoot, logDir,
+    isAlive, maybeSpawn, stateStore, configDirFor, ownerUserId, dispatchBotUserId,
+    dispatchStream, fleetRoot, retiredRoot, logDir,
   } = ctx;
 
   async function postToDispatch(topic: string, content: string): Promise<void> {
@@ -154,13 +155,18 @@ export function makeDispatchHandlers(ctx: DispatchCtx): DispatchHandlers {
     return { user_id: created.user_id, email, api_key: created.api_key };
   }
 
-  // Zulip auto-subscribes the caller (dispatch-bot, since `zulip` is its client).
+  // dispatch-bot must be in `principals` explicitly: when /subscriptions is
+  // called with `principals` set, Zulip subscribes only those users — the
+  // API caller is NOT auto-added. Without this, dispatch-bot's event queue
+  // never sees messages in the new home stream and inbounds vanish silently.
+  // (Earlier code/comment claimed auto-subscribe; that's only true when
+  // `principals` is omitted entirely. Confirmed by hitting it on #landfall.)
   async function provisionHomeStream(name: string, botUserId: number): Promise<void> {
     await zulip('/users/me/subscriptions', {
       method: 'POST',
       params: {
         subscriptions: [{ name }],
-        principals: [ownerUserId, botUserId],
+        principals: [ownerUserId, botUserId, dispatchBotUserId],
       },
     });
   }
