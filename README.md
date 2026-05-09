@@ -84,7 +84,6 @@ End-to-end working:
 ## Roadmap
 
 - **Cross-platform.** macOS verified. Linux probably fine (POSIX paths + Python's `pty` is Unix-only but works there). Windows currently broken: `scripts/pty-helper.py` relies on Unix PTY APIs. Either fix `node-pty`'s `posix_spawnp` failure (we hit it on macOS during the build but didn't fully diagnose) or write a Windows-specific spawn path.
-- **Smarter dispatcher.** The dispatcher's command grammar is hand-coded regex. A meta-Claude *inside* `@dispatch-bot` could interpret natural-language requests ("spin up a Python expert that handles refactoring questions, name it pyrefactor") and translate them into structured calls. Removes the need to extend the parser for every new operation.
 - **Handoff on shutdown.** `shut down` and `compact` don't auto-invoke the `/handoff` skill to capture tacit state — `--resume` carries conversation history but not the latent stuff (working hypotheses, ruled-out approaches, "what was I about to do"). Brittle to implement (the dispatcher has to instruct Claude to write the file, then wait for completion or timeout, then kill); deferred for now.
 - **Smarter inter-bot loop handling.** The basic @-mention relay ships with a crude rate limit (10 forwards/60s per target) — enough to bound runaway loops but heavy-handed. A real solution tracks mention-chain depth or per-conversation forward graphs.
 - **Plugin packaging.** Get the channel server onto Anthropic's `--channels` allowlist so the dispatcher doesn't need `--dangerously-load-development-channels`.
