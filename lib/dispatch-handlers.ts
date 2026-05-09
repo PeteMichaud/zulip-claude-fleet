@@ -10,6 +10,7 @@
 
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { ensureBotSettings } from './bot-settings.ts';
 import type { Command } from './commands.ts';
 import { humanDuration } from './format.ts';
 import type { BotStateStore } from './state.ts';
@@ -38,6 +39,7 @@ export type DispatchCtx = {
   configDirFor: (bot: Bot) => string;
   ownerUserId: number;
   dispatchBotUserId: number;
+  hookScriptPath: string;
   dispatchStream: string;
   fleetRoot: string;
   retiredRoot: string;
@@ -53,7 +55,7 @@ export function makeDispatchHandlers(ctx: DispatchCtx): DispatchHandlers {
   const {
     zulip, zulipAsOwner, log, registry, saveRegistry, runningBots, startTimes,
     isAlive, maybeSpawn, stateStore, configDirFor, ownerUserId, dispatchBotUserId,
-    dispatchStream, fleetRoot, retiredRoot, logDir,
+    hookScriptPath, dispatchStream, fleetRoot, retiredRoot, logDir,
   } = ctx;
 
   async function postToDispatch(topic: string, content: string): Promise<void> {
@@ -175,10 +177,8 @@ export function makeDispatchHandlers(ctx: DispatchCtx): DispatchHandlers {
     mkdirSync(cwd, { recursive: true });
     mkdirSync(join(cwd, '.claude'), { recursive: true });
     writeFileSync(join(cwd, 'CLAUDE.md'), claudeMdStub(name));
-    writeFileSync(
-      join(cwd, '.claude', 'settings.local.json'),
-      JSON.stringify({ permissions: { allow: ['mcp__zulip-channel__*'] } }, null, 2) + '\n',
-    );
+    // Permissions allowlist + Stop hook to enforce send (see bot-settings.ts).
+    ensureBotSettings({ cwd, hookScriptPath });
   }
 
   async function cmdCreate(

@@ -19,6 +19,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync,
 import { join } from 'node:path';
 import { makeZulipClient } from './lib/zulip.ts';
 import { isDestructive, parseCommand, renderCommand, type Command } from './lib/commands.ts';
+import { ensureBotSettings } from './lib/bot-settings.ts';
 import { makeDispatchHandlers } from './lib/dispatch-handlers.ts';
 import { humanDuration } from './lib/format.ts';
 import { nlDispatch } from './lib/nl-dispatch.ts';
@@ -94,6 +95,7 @@ mkdirSync(LOG_DIR, { recursive: true });
 
 const SHARED_MCP_CONFIG = join(import.meta.dir, 'shared-mcp.json');
 const PTY_HELPER = join(import.meta.dir, 'scripts', 'pty-helper.py');
+const HOOK_SCRIPT_PATH = join(import.meta.dir, 'scripts', 'enforce-send.ts');
 
 // Resolve which Claude config dir a bot runs under. Precedence:
 //   1. Per-bot override (Bot.config_dir, settable via `create --config` /
@@ -305,6 +307,15 @@ async function spawnBot(bot: Bot, trigger: WakeTrigger): Promise<void> {
   } catch (err: any) {
     log(`@${bot.name}: pre-trust failed (non-fatal): ${err.message}`);
   }
+  // Ensure .claude/settings.local.json has the latest permission allowlist
+  // and Stop hook (enforce-send). Idempotent — migrates older bots created
+  // before either field existed.
+  try {
+    const result = ensureBotSettings({ cwd: bot.cwd, hookScriptPath: HOOK_SCRIPT_PATH });
+    if (result.changed) log(`@${bot.name}: settings.local.json updated (${result.path})`);
+  } catch (err: any) {
+    log(`@${bot.name}: settings.local.json migrate failed (non-fatal): ${err.message}`);
+  }
 
   const child = Bun.spawn({
     cmd,
@@ -431,6 +442,7 @@ const handlers = makeDispatchHandlers({
   configDirFor,
   ownerUserId: OWNER_USER_ID,
   dispatchBotUserId: DISPATCH_BOT_USER_ID,
+  hookScriptPath: HOOK_SCRIPT_PATH,
   dispatchStream: DISPATCH_STREAM,
   fleetRoot: FLEET_ROOT,
   retiredRoot: RETIRED_ROOT,
