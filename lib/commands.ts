@@ -7,6 +7,7 @@ export type Command =
   | { kind: 'shutDown'; target: string }
   | { kind: 'reset'; target: string }
   | { kind: 'create'; target: string; configDir?: string; noSpin?: boolean; auto?: boolean; yolo?: boolean }
+  | { kind: 'clone'; source: string; newName?: string; noSpin?: boolean }
   | {
       kind: 'update';
       target: string;
@@ -75,6 +76,7 @@ const HEADS: Array<{ phrase: string; kind: HeadKind }> = [
   { phrase: 'kill', kind: 'shutDown' },
   { phrase: 'reset', kind: 'reset' },
   { phrase: 'create', kind: 'create' },
+  { phrase: 'clone', kind: 'clone' },
   { phrase: 'update', kind: 'update' },
   { phrase: 'retire', kind: 'retire' },
   { phrase: 'list', kind: 'listActive' },
@@ -189,6 +191,18 @@ export function parseCommand(text: string): Command {
       return out;
     }
 
+    case 'clone': {
+      // `clone <source>` (auto-named) or `clone <source> <newname>`.
+      const source = target;
+      if (!source) return { kind: 'unknown', text: trimmed };
+      const newName = parseTargetToken(positionals[1]);
+      const noSpin = flags.get('no-spin') === true;
+      const out: Command = { kind: 'clone', source };
+      if (newName) out.newName = newName;
+      if (noSpin) out.noSpin = true;
+      return out;
+    }
+
     case 'update': {
       if (!target) return { kind: 'unknown', text: trimmed };
       const configFlag = flags.get('config');
@@ -275,6 +289,12 @@ export function renderCommand(cmd: Command): string {
       if (cmd.noSpin) parts.push('--no-spin');
       if (cmd.auto) parts.push('--auto');
       if (cmd.yolo) parts.push('--yolo');
+      return parts.join(' ');
+    }
+    case 'clone': {
+      const parts = ['clone', cmd.source];
+      if (cmd.newName) parts.push(cmd.newName);
+      if (cmd.noSpin) parts.push('--no-spin');
       return parts.join(' ');
     }
     case 'update': {

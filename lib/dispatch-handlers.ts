@@ -11,6 +11,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { ensureBotSettings } from './bot-settings.ts';
+import { executeClone, scanForClone, type ExecFn } from './clone-worktree.ts';
 import type { Command } from './commands.ts';
 import { humanDuration } from './format.ts';
 import type { BotStateStore } from './state.ts';
@@ -19,6 +20,7 @@ import type { ZulipClient } from './zulip.ts';
 import {
   createChannelFolder,
   findFolderByName,
+  getStreamFolder,
   getStreamId,
   listChannelFolders,
   setStreamFolder,
@@ -254,6 +256,196 @@ export function makeDispatchHandlers(ctx: DispatchCtx): DispatchHandlers {
     lines.push(`Spinning up @${name} now — say what kind of bot it should be in #${name}.`);
     await postToDispatch(topic, lines.join('\n'));
     await cmdSpinUp(topic, name);
+  }
+
+  // Pick the smallest <source>-N (N ≥ 2) not already in the registry. Matches
+  // the operator's mental model — `clone zulip-fleet` lands at zulip-fleet-2,
+  // a second clone at zulip-fleet-3, regardless of which was retired in
+  // between (we don't reuse names of retired bots either way).
+  function nextCloneName(source: string): string {
+    for (let n = 2; n < 1000; n++) {
+      const candidate = `${source}-${n}`;
+      if (!registry[candidate]) return candidate;
+    }
+    throw new Error(`couldn't find an unused name with prefix ${source}-`);
+  }
+
+  // Real shell-out for git. Factored out so cmdClone's logic can be tested by
+  // swapping ExecFn elsewhere; here we always use the real one.
+  const realExec: ExecFn = async (cmd, args, opts) => {
+    const proc = Bun.spawn({
+      cmd: [cmd, ...args],
+      cwd: opts?.cwd,
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    const exitCode = await proc.exited;
+    const stdout = await new Response(proc.stdout).text();
+    const stderr = await new Response(proc.stderr).text();
+    return { exitCode, stdout, stderr };
+  };
+
+  async function cmdClone(
+    topic: string,
+    sourceName: string,
+    opts: { newName?: string; noSpin?: boolean } = {},
+  ): Promise<void> {
+    const source = registry[sourceName];
+    if (!source) return postToDispatch(topic, `no bot named \`${sourceName}\` in registry`);
+
+    let newName: string;
+    if (opts.newName) {
+      if (!/^[a-z][a-z0-9_-]*$/.test(opts.newName)) {
+        return postToDispatch(topic, `invalid name \`${opts.newName}\` — must start with a lowercase letter and contain only [a-z0-9_-]`);
+      }
+      if (registry[opts.newName]) {
+        return postToDispatch(topic, `\`${opts.newName}\` already in registry; pick a different name or \`retire\` it first`);
+      }
+      newName = opts.newName;
+    } else {
+      try {
+        newName = nextCloneName(sourceName);
+      } catch (err: any) {
+        return postToDispatch(topic, `auto-name picker exhausted: ${err.message}`);
+      }
+    }
+
+    if (!existsSync(source.cwd)) {
+      return postToDispatch(topic, `source worktree missing on disk: \`${source.cwd}\` — registry says it lives here but it doesn't. Aborting clone.`);
+    }
+
+    await postToDispatch(topic, `cloning @${sourceName} → @${newName}…`);
+
+    // Scan first so we can fail fast if anything looks off, before we
+    // provision any Zulip-side resources we'd then need to roll back.
+    let scan;
+    try {
+      scan = scanForClone(source.cwd);
+    } catch (err: any) {
+      return postToDispatch(topic, `scan of source worktree failed: ${err.message}`);
+    }
+    if (scan.repoPaths.length === 0) {
+      // No repos to worktree-add — bot doesn't track any code in its own
+      // worktree. Honest reply rather than a silent no-op or a sham clone.
+      return postToDispatch(
+        topic,
+        `@${sourceName}'s worktree contains no git repos at the top level. If it works on a repo elsewhere on disk, clone won't help here — that's outside what \`clone\` handles. Make a fresh \`create\` and wire it up by hand.`,
+      );
+    }
+
+    let botUser: { user_id: number; email: string; api_key: string };
+    try {
+      botUser = await provisionBotUser(newName);
+    } catch (err: any) {
+      return postToDispatch(topic, `failed to create bot user: ${err.message}`);
+    }
+    log(`@${newName}: created bot user (user_id ${botUser.user_id}, email ${botUser.email})`);
+
+    try {
+      await provisionHomeStream(newName, botUser.user_id);
+    } catch (err: any) {
+      return postToDispatch(
+        topic,
+        `bot user created but stream creation failed: ${err.message}. orphan bot user_id=${botUser.user_id}, email=${botUser.email}`,
+      );
+    }
+    log(`@${newName}: stream #${newName} ready`);
+
+    // Inherit channel folder from source if the source has one. Skipped
+    // silently if zulipAsOwner isn't configured — folder ops have always
+    // required owner creds, and a missing folder isn't a clone failure.
+    let folderInherited = false;
+    if (zulipAsOwner) {
+      try {
+        const srcStreamId = await getStreamId(zulipAsOwner, source.home_stream);
+        const folderId = await getStreamFolder(zulipAsOwner, srcStreamId);
+        if (folderId !== null) {
+          const newStreamId = await getStreamId(zulipAsOwner, newName);
+          await setStreamFolder(zulipAsOwner, newStreamId, folderId);
+          folderInherited = true;
+        }
+      } catch (err: any) {
+        log(`@${newName}: folder inheritance failed (non-fatal): ${err.message}`);
+      }
+    }
+
+    const branch = `bot/${newName}`;
+    const cwd = join(fleetRoot, newName);
+    let cloneResult;
+    try {
+      cloneResult = await executeClone({
+        sourceCwd: source.cwd,
+        targetCwd: cwd,
+        branch,
+        scan,
+        exec: realExec,
+      });
+    } catch (err: any) {
+      return postToDispatch(
+        topic,
+        `clone of worktree failed: ${err.message}. Bot user + stream were created; you may want to \`retire ${newName}\` to clean up.`,
+      );
+    }
+
+    // Pretrust + settings.local.json migrate happen at spawn time, so we
+    // don't repeat them here. But ensureBotSettings now so the operator can
+    // inspect the new tree before first spawn if they want.
+    try {
+      ensureBotSettings({ cwd, hookScriptPath });
+    } catch (err: any) {
+      log(`@${newName}: ensureBotSettings (non-fatal): ${err.message}`);
+    }
+
+    const entry: Bot = {
+      name: newName,
+      home_stream: newName,
+      cwd,
+      bot_email: botUser.email,
+      bot_api_key: botUser.api_key,
+    };
+    // Inherit per-bot flags from source — auto/yolo/config_dir reflect the
+    // operator's prior choice for this kind of bot, and a clone is almost
+    // certainly the same kind.
+    if (source.config_dir) entry.config_dir = source.config_dir;
+    if (source.auto) entry.auto = true;
+    if (source.yolo) entry.yolo = true;
+    registry[newName] = entry;
+    saveRegistry(registry);
+
+    const lines = [
+      `✓ @${newName} cloned from @${sourceName}`,
+      `- bot user: \`${botUser.email}\` (user_id ${botUser.user_id})`,
+      `- home stream: \`#${newName}\`${folderInherited ? ' (inherited folder from source)' : ''}`,
+      `- working tree: \`${cwd}\``,
+    ];
+    if (cloneResult.worktreesAdded.length > 0) {
+      const repoLabels = cloneResult.worktreesAdded
+        .map((w) => (w.targetPath === cwd ? '(root)' : w.targetPath.slice(cwd.length + 1)))
+        .join(', ');
+      lines.push(`- git worktrees added on branch \`${branch}\`: ${repoLabels}`);
+    }
+    if (cloneResult.copied.length > 0) {
+      lines.push(`- copied non-repo entries: ${cloneResult.copied.map((p) => `\`${p}\``).join(', ')}`);
+    }
+    lines.push(
+      `_Uncommitted WIP in @${sourceName} did **not** transfer — \`git worktree add\` checks out the branch's HEAD. Stash/commit it there first if you wanted it carried over._`,
+    );
+    if (scan.skipped.includes('node_modules')) {
+      lines.push(
+        `_\`node_modules\` was skipped. Run \`bun install\` (or your package manager) in the new worktree before first use._`,
+      );
+    }
+    if (source.yolo) lines.push(`- mode: **yolo** (inherited)`);
+    else if (source.auto) lines.push(`- mode: **auto** (inherited)`);
+
+    if (opts.noSpin) {
+      lines.push(`Run \`spin up ${newName}\` when you're ready.`);
+      await postToDispatch(topic, lines.join('\n'));
+      return;
+    }
+    lines.push(`Spinning up @${newName} now in #${newName}.`);
+    await postToDispatch(topic, lines.join('\n'));
+    await cmdSpinUp(topic, newName);
   }
 
   async function cmdUpdate(
@@ -558,6 +750,7 @@ export function makeDispatchHandlers(ctx: DispatchCtx): DispatchHandlers {
       ['shut down @<bot>', 'kill that bot (next start will resume)', 'stop, kill'],
       ['reset @<bot>', 'kill and clear stored session; next start is fresh'],
       ['create <name> [--config <path>] [--no-spin] [--auto] [--yolo]', 'provision a new bot end-to-end and spin it up. --auto = auto-approve non-danger prompts. --yolo = pass --dangerously-skip-permissions (bypasses ALL prompts including danger).', 'create-bot'],
+      ['clone <source> [<newname>] [--no-spin]', 'copy a bot: new Zulip identity + stream, `git worktree add -b bot/<newname>` for each repo in the source\'s worktree, plain copy for the rest. Inherits the source\'s folder and auto/yolo flags. Uncommitted WIP in source does NOT transfer.'],
       ['update <name> [--config <path> | --clear-config] [--auto | --no-auto] [--yolo | --no-yolo]', 'change a bot\'s per-bot settings (config change clears session; auto/yolo apply on next spawn)'],
       ['retire <name>', 'kill, deactivate Zulip bot, archive stream, remove from registry'],
       ['list active', 'running bots + uptime', 'list'],
@@ -588,6 +781,10 @@ export function makeDispatchHandlers(ctx: DispatchCtx): DispatchHandlers {
         noSpin: cmd.noSpin ?? false,
         auto: cmd.auto ?? false,
         yolo: cmd.yolo ?? false,
+      });
+      case 'clone':        return cmdClone(topic, cmd.source, {
+        newName: cmd.newName,
+        noSpin: cmd.noSpin ?? false,
       });
       case 'update':       return cmdUpdate(topic, cmd.target, cmd);
       case 'retire':       return cmdRetire(topic, cmd.target);
