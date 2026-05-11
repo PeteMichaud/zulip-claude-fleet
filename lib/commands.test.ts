@@ -241,6 +241,23 @@ describe('parseCommand', () => {
     expect(parseCommand('Help')).toEqual({ kind: 'help' });
   });
 
+  test('clone', () => {
+    expect(parseCommand('clone zulip-fleet')).toEqual({ kind: 'clone', source: 'zulip-fleet' });
+    expect(parseCommand('clone zulip-fleet sidekick')).toEqual({
+      kind: 'clone', source: 'zulip-fleet', newName: 'sidekick',
+    });
+    expect(parseCommand('clone briefing notes-bot --no-spin')).toEqual({
+      kind: 'clone', source: 'briefing', newName: 'notes-bot', noSpin: true,
+    });
+    expect(parseCommand('clone @briefing')).toEqual({ kind: 'clone', source: 'briefing' });
+    // Missing source → unknown.
+    expect(parseCommand('clone')).toEqual({ kind: 'unknown', text: 'clone' });
+    // Junk new-name token gets dropped (parseTargetToken rejects "99-bad"
+    // because target names must start with a lowercase letter); clone still
+    // succeeds and falls back to auto-naming.
+    expect(parseCommand('clone briefing 99-bad')).toEqual({ kind: 'clone', source: 'briefing' });
+  });
+
   test('unknown', () => {
     expect(parseCommand('foo bar')).toEqual({ kind: 'unknown', text: 'foo bar' });
     expect(parseCommand('')).toEqual({ kind: 'unknown', text: '' });

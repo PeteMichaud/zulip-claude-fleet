@@ -58,6 +58,17 @@ export async function setStreamFolder(
   });
 }
 
+// Returns the channel-folder id currently assigned to a stream, or null if
+// the stream is in no folder. Used by `clone` to inherit the source's folder.
+export async function getStreamFolder(
+  client: ZulipClient,
+  streamId: number,
+): Promise<number | null> {
+  const res = await client(`/streams/${streamId}`);
+  const fid = res?.stream?.folder_id;
+  return typeof fid === 'number' ? fid : null;
+}
+
 // Resolve a folder name to its id. Returns null if no folder by that name
 // exists; the caller decides whether to error or auto-create.
 export async function findFolderByName(

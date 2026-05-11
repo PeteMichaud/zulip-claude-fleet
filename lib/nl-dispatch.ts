@@ -188,6 +188,22 @@ function validateCommand(parsed: unknown): NLCommand | null {
       return out;
     }
 
+    case 'clone': {
+      // The NL fallback may name source either as `source` or `target`
+      // (the schema uses `target` everywhere else and the model leans on
+      // that habit); accept both.
+      const sourceRaw = typeof obj.source === 'string' ? obj.source
+        : typeof obj.target === 'string' ? obj.target
+        : undefined;
+      const source = parseTargetToken(sourceRaw);
+      if (!source) return null;
+      const newName = typeof obj.newName === 'string' ? parseTargetToken(obj.newName) : undefined;
+      const out: NLCommand = { kind: 'clone', source };
+      if (newName) out.newName = newName;
+      if (obj.noSpin === true) out.noSpin = true;
+      return out;
+    }
+
     case 'update': {
       if (!target) return null;
       const out: NLCommand = { kind: 'update', target };
