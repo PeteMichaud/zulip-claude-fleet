@@ -13,11 +13,12 @@
 // silence so a wedged bot doesn't appear "still typing" for minutes —
 // the ⌛ reaction takes over as the operator's "this is stuck" signal.
 //
-// Stream-typing in Zulip requires `to: [stream_id]` (a list with one
-// numeric id) — the channel's *name* is not accepted. Stream ids are
-// resolved lazily via /get_stream_id and cached for the process lifetime;
-// stream renames mid-session would invalidate the cache, but home streams
-// don't rename in practice.
+// Stream-typing in Zulip uses `stream_id: <int>` plus `topic`. The older
+// `to: [stream_id]` list form was deprecated in Zulip 8.0 (feature level
+// 215) and is no longer accepted by Zulip Cloud. Stream ids are resolved
+// lazily via /get_stream_id and cached for the process lifetime; stream
+// renames mid-session would invalidate the cache, but home streams don't
+// rename in practice.
 
 import type { ZulipClient } from './zulip.ts';
 import { getStreamId } from './zulip-admin.ts';
@@ -73,7 +74,7 @@ export function makeTypingIndicator(
     try {
       await zulip('/typing', {
         method: 'POST',
-        params: { type: 'stream', op, to: [id], topic },
+        params: { type: 'stream', op, stream_id: id, topic },
       });
     } catch (err: any) {
       log(`typing: ${op} failed (non-fatal):`, err.message);

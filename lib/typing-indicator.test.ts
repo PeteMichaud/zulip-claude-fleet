@@ -27,7 +27,7 @@ describe('makeTypingIndicator', () => {
 
     const calls = typingCalls(zulip);
     expect(calls).toHaveLength(1);
-    expect(calls[0].params).toEqual({ type: 'stream', op: 'start', to: [42], topic: 'chat' });
+    expect(calls[0].params).toEqual({ type: 'stream', op: 'start', stream_id: 42, topic: 'chat' });
     expect(indicator.isEmitting()).toBe(true);
     await indicator.stop();
   });
@@ -41,7 +41,7 @@ describe('makeTypingIndicator', () => {
 
     const calls = typingCalls(zulip);
     expect(calls).toHaveLength(2);
-    expect(calls[1].params).toMatchObject({ op: 'stop', to: [42], topic: 'chat' });
+    expect(calls[1].params).toMatchObject({ op: 'stop', stream_id: 42, topic: 'chat' });
     expect(indicator.isEmitting()).toBe(false);
   });
 
@@ -78,10 +78,10 @@ describe('makeTypingIndicator', () => {
 
     const calls = typingCalls(zulip);
     // Expect: start(home), stop(home), start(other)
-    expect(calls.map((c) => [c.params!.op, c.params!.to, c.params!.topic])).toEqual([
-      ['start', [42], 'chat'],
-      ['stop', [42], 'chat'],
-      ['start', [99], 'design'],
+    expect(calls.map((c) => [c.params!.op, c.params!.stream_id, c.params!.topic])).toEqual([
+      ['start', 42, 'chat'],
+      ['stop', 42, 'chat'],
+      ['start', 99, 'design'],
     ]);
     await indicator.stop();
   });
