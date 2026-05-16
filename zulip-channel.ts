@@ -20,6 +20,7 @@ import { chunkMessage } from './lib/chunking.ts';
 import { formatPreview } from './lib/format.ts';
 import { isDangerousToolCall, PERMISSION_REPLY_RE } from './lib/permission.ts';
 import { makeHeartbeat } from './lib/heartbeat.ts';
+import { makeTypingIndicator } from './lib/typing-indicator.ts';
 import { startJsonlActivityWatcher } from './lib/jsonl-tail.ts';
 import { appendAllowEntry, derivePattern, matchesAllow } from './lib/allowlist.ts';
 import { fetchMessagesSince } from './lib/zulip-catchup.ts';
@@ -57,6 +58,9 @@ const zulip = makeZulipClient({ site: SITE, email: BOT_EMAIL, apiKey: API_KEY })
 // Per-inbound liveness reactions (👀 → 🛠️ → ⌛ → ✓) — see lib/heartbeat.ts.
 const heartbeat = makeHeartbeat(zulip, debug);
 
+// "@bot is typing…" pulses paired with the heartbeat — see lib/typing-indicator.ts.
+const typing = makeTypingIndicator(zulip, debug);
+
 // Tail Claude's session JSONL so the heartbeat can swap 👀 → 🛠️ when Claude
 // is actively writing (tool calls, partial messages) and 🛠️ → ⌛ when it's
 // gone quiet for 30s. The JSONL lives at
@@ -72,6 +76,7 @@ const heartbeat = makeHeartbeat(zulip, debug);
     projectsDir,
     onActivity: () => {
       heartbeat.bumpActivity();
+      typing.bumpActivity();
       claudeIsAlive = true; // also clears the wake-trigger watchdog
     },
     log: debug,
@@ -193,6 +198,7 @@ async function sendTool(args: Record<string, unknown>) {
     });
   }
   await heartbeat.ack();
+  await typing.stop();
   return {
     content: [
       { type: 'text', text: `sent (${chunks.length} message${chunks.length > 1 ? 's' : ''}) to ${stream} > ${topic}` },
@@ -442,6 +448,7 @@ async function replayWakeTriggerIfPresent() {
   if (typeof parsed.inbound_message_id === 'number') {
     heartbeat.note(parsed.inbound_message_id);
   }
+  typing.note(parsed.stream!, topic);
 
   const sendNotification = () => mcp.notification({
     method: 'notifications/claude/channel',
@@ -555,6 +562,7 @@ async function handleMessage(event: any) {
   const topic = msg.subject || DEFAULT_TOPIC;
   lastInbound = { stream, topic };
   if (typeof msg.id === 'number') heartbeat.note(msg.id);
+  typing.note(stream, topic);
   await mcp.notification({
     method: 'notifications/claude/channel',
     params: {
@@ -595,6 +603,10 @@ const shutdown = () => {
   running = false;
   for (const t of wakeWatchdogTimers) clearTimeout(t);
   wakeWatchdogTimers.clear();
+  // Best-effort stop — fire-and-forget; we're about to exit anyway and any
+  // unfinished stop request will be reaped along with the process. Without
+  // this the indicator's interval would block clean exit until Zulip's TTL.
+  typing.stop().catch(() => { /* shutting down */ });
 };
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
